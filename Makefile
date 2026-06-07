@@ -1,5 +1,5 @@
 build-app:
-	@go build -o ./bin/app ./...
+	@go build -o ./bin/app ./cmd/.
 	@chmod +x ./bin/app
 
 app: build-app
@@ -8,3 +8,4 @@ app: build-app
 test-app-race:
 	@go clean -testcache
 	@go test -race -v ./...
+	

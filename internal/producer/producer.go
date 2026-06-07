@@ -23,7 +23,8 @@ func NewKafkaProducer(topic string) *KafkaProducer {
 		panic(err)
 	}
 
-	defer p.Close()
+	// ห้าม defer p.Close() ตรงนี้! เพราะ constructor จะ return ทันที
+	// → producer ถูกปิดก่อนได้ใช้ ให้ปิดตอน shutdown ผ่าน method Close() แทน
 
 	// Delivery report handler for produced messages
 	go func() {
@@ -46,10 +47,20 @@ func NewKafkaProducer(topic string) *KafkaProducer {
 }
 
 func (p *KafkaProducer) Producer(msg string) {
-
-	p.producer.Produce(&kafka.Message{
+	err := p.producer.Produce(&kafka.Message{
 		TopicPartition: kafka.TopicPartition{Topic: &p.topic, Partition: kafka.PartitionAny},
 		Value:          []byte(msg),
 	}, nil)
 
+	if err != nil {
+		fmt.Printf("error producing msg := %v\n", err)
+	}
+
+}
+
+// Close ปิด producer ให้เรียกตอน graceful shutdown (เช่นใน main ก่อนจบโปรแกรม)
+// Flush รอ message ที่ค้างใน queue ให้ส่งครบก่อน (รอสูงสุด 5 วินาที) แล้วค่อยปิด
+func (p *KafkaProducer) Close() {
+	p.producer.Flush(5000)
+	p.producer.Close()
 }
