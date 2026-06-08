@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
@@ -14,17 +15,25 @@ import (
 type KafkaConsumer struct {
 	Consumer *kafka.Consumer
 	topic    string
-	msgCH    chan<- string
+	msgCH    chan *shared.Message
 	readyCH  chan struct{}
+	exitCH   chan struct{}
 	isReady  bool
+
+	msgsStateMap map[kafka.Offset]bool
+	lastCommited kafka.Offset
+	maxReceived  *kafka.TopicPartition
+	mu           *sync.RWMutex
+	commitDur    time.Duration
 }
 
-func NewKafkaConsumer(msgCH chan<- string) (*KafkaConsumer, error) {
+func NewKafkaConsumer(msgCH chan *shared.Message) (*KafkaConsumer, error) {
 	cfg := shared.NewKafkaConfig()
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers": cfg.Host,
-		"group.id":          cfg.ConsumerGroup,
-		"auto.offset.reset": "earliest",
+		"bootstrap.servers":  cfg.Host,
+		"group.id":           cfg.ConsumerGroup,
+		"enable.auto.commit": false,
+		// "auto.offset.reset": "earliest",
 	})
 
 	// topic order confirmed -> delivery -> payment, noticition -> ws
@@ -38,12 +47,37 @@ func NewKafkaConsumer(msgCH chan<- string) (*KafkaConsumer, error) {
 		return nil, err
 	}
 
+	tp := kafka.TopicPartition{
+		Topic:     &cfg.Topic,
+		Partition: 0,
+	}
+
+	commited, err := c.Committed([]kafka.TopicPartition{tp}, int(time.Second)*5)
+	if err != nil {
+		fmt.Println(err)
+		return nil, err
+	}
+
+	latestComm := commited[len(commited)-1].Offset
+	logrus.WithField("OFFSET", latestComm).Info("starting POSITION")
+	maxReceived := &kafka.TopicPartition{
+		Topic:     tp.Topic,
+		Partition: tp.Partition,
+		Offset:    latestComm,
+	}
+
 	consumer := &KafkaConsumer{
-		Consumer: c,
-		topic:    cfg.ConsumerGroup,
-		msgCH:    msgCH,
-		readyCH:  make(chan struct{}),
-		isReady:  false,
+		Consumer:     c,
+		msgCH:        msgCH,
+		readyCH:      make(chan struct{}),
+		exitCH:       make(chan struct{}),
+		isReady:      false,
+		topic:        cfg.ConsumerGroup,
+		mu:           new(sync.RWMutex),
+		msgsStateMap: map[kafka.Offset]bool{},
+		lastCommited: latestComm,
+		maxReceived:  maxReceived,
+		commitDur:    15 * time.Second,
 	}
 
 	consumer.initializeKafkaTopic(cfg.Host, cfg.Topic)
@@ -54,6 +88,7 @@ func NewKafkaConsumer(msgCH chan<- string) (*KafkaConsumer, error) {
 		return nil, err
 	}
 
+	go consumer.commitOffsetLoop()
 	go consumer.checkReadyToAccept()
 	go consumer.readMsgLoop()
 
@@ -77,11 +112,104 @@ func (c *KafkaConsumer) readMsgLoop() {
 		}
 
 		// มาถึงตรงนี้ msg ไม่เป็น nil แน่นอน
-		payload := msg.Value
-		c.msgCH <- string(payload)
+		c.appendMsgState(&msg.TopicPartition)
+		payload := shared.NewMessage(&msg.TopicPartition, msg.Value)
+		c.msgCH <- payload
 	}
 
 	// process msg
+}
+
+func (c *KafkaConsumer) appendMsgState(tp *kafka.TopicPartition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.msgsStateMap[tp.Offset] = false
+	if c.maxReceived.Offset < tp.Offset {
+		c.maxReceived = &kafka.TopicPartition{
+			Topic:     tp.Topic,
+			Partition: tp.Partition,
+			Offset:    tp.Offset,
+		}
+	}
+}
+
+func (c *KafkaConsumer) MarkAsComplete(tp *kafka.TopicPartition) {
+	logrus.WithField("OFFSET", tp.Offset).Info("MarkAsComplete")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.msgsStateMap[tp.Offset] = true
+}
+
+func (c *KafkaConsumer) commitOffsetLoop() {
+	ticker := time.NewTicker(c.commitDur)
+	for {
+		select {
+		case <-ticker.C:
+			c.mu.Lock()
+			if c.maxReceived == nil {
+				continue
+			}
+			latestToCommit := *c.maxReceived
+			if c.lastCommited > c.maxReceived.Offset {
+				panic("last commit above maxReceived")
+			}
+
+			if c.lastCommited == c.maxReceived.Offset {
+				fmt.Println("lastCommit == maxReceived -> skipping")
+				continue
+			}
+
+			for offset := c.lastCommited; offset < c.maxReceived.Offset; offset++ {
+				completed, exists := c.msgsStateMap[offset]
+				if !exists {
+					continue
+				}
+				if completed {
+					delete(c.msgsStateMap, offset)
+					continue
+				}
+
+				// 1 2 3 4
+				// t t f t
+				// c c n n
+				// n = 3
+				latestToCommit.Offset = offset
+				break
+			}
+			c.mu.Unlock()
+
+			if latestToCommit.Offset == c.lastCommited {
+				continue
+			}
+
+			_, err := c.Consumer.CommitOffsets([]kafka.TopicPartition{latestToCommit})
+			// crushed
+			// restarted
+			// 3, 4, 5, 6
+			if err != nil {
+				fmt.Printf("err commiting offset = %d, err = %v\n", latestToCommit.Offset, err)
+				continue
+			}
+
+			c.mu.Lock()
+			c.lastCommited = latestToCommit.Offset - 1
+			fmt.Printf("state AFTER commit\n")
+			for offset, v := range c.msgsStateMap {
+				fmt.Printf("off = %d, v =%t\n", offset, v)
+			}
+			c.mu.Unlock()
+
+			logrus.WithFields(
+				logrus.Fields{
+					"OFFSET": latestToCommit.Offset - 1,
+				},
+			).Warn("Commited on CRON")
+
+		case <-c.exitCH:
+			return
+		}
+	}
 }
 
 func (c *KafkaConsumer) initializeKafkaTopic(brokers, topicName string) error {

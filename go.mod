@@ -4,6 +4,8 @@ go 1.26.3
 
 require (
 	github.com/confluentinc/confluent-kafka-go/v2 v2.14.2
+	github.com/jmoiron/sqlx v1.4.0
+	github.com/lib/pq v1.12.3
 	github.com/sirupsen/logrus v1.9.4
 )
 
