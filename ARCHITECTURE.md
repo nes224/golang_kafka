@@ -15,6 +15,7 @@
 5. [กลไกสำคัญเชิงลึก](#5-กลไกสำคัญเชิงลึก)
 6. [Rebuild from scratch](#6-rebuild-from-scratch)
 7. [ข้อควรระวัง / Known issues](#7-ข้อควรระวัง--known-issues)
+8. [Scaling to production](#8-scaling-to-production)
 
 ---
 
@@ -477,3 +478,59 @@ make app
 **6. `field topic: cfg.ConsumerGroup`** — ใน consumer struct เซ็ต `topic` เป็นค่า ConsumerGroup (ดูเหมือนพิมพ์สลับ) แต่ field นี้ไม่ถูกใช้ที่ไหน เลยไม่กระทบการทำงาน
 
 **7. `Event.Timespamp`** — สะกดผิด (ควรเป็น Timestamp) แต่ db tag ถูก (`timestamp`) เลยทำงานได้ปกติ แก้ชื่อ field ทีหลังได้
+
+---
+
+## 8. Scaling to production
+
+โค้ดปัจจุบันเป็นเวอร์ชัน **1 partition / 1 consumer** ส่วนนี้อธิบายว่าระบบจะหน้าตาเป็นยังไงเมื่อ scale ขึ้นจริง (หลาย partition + หลาย pod + หลาย consumer group) และต้องปรับโค้ดอะไรบ้าง
+
+### 8.1 กฎ partition + consumer group (5 ข้อ)
+
+```
+1. แต่ละ partition เป็นเจ้าของ offset ของตัวเอง และเรียงลำดับภายใน
+2. 1 partition = 1 consumer ต่อ group  (ห้ามแชร์ partition ในกลุ่มเดียว)
+3. 1 consumer ถือได้หลาย partition
+4. ถ้า consumer > partition → ตัวที่เกินจะ IDLE (รอ rebalance)
+5. คนละ consumer group อ่าน partition เดียวกันได้อิสระ (ต่างคนต่างจำ offset)
+```
+
+> offset นับแยกต่อ partition — P0 มี offset 0,1,2… และ P1 ก็มี 0,1,2… เป็นคนละชุดกัน ระบุ message 1 ชิ้นต้องใช้ `topic + partition + offset`
+
+### 8.2 ภาพ scale: topic 3 partition + group `local_cg` (4 pod)
+
+3 partition แจกให้ 3 pod, pod ที่ 4 ว่างงาน (กฎข้อ 4) แต่ละ pod ถือ **PartitionState** ของตัวเอง (= `lastCommitted` + `maxReceived` + `msgsStateMap` ใน struct `KafkaConsumer`) และรัน `commitOffsetLoop` แยกกัน:
+
+| Pod | partition | msgsStateMap | scan เจออะไร | commit ถึง |
+|---|---|---|---|---|
+| Pod 3 | P2 | 1✓ 2✓ 3✓ | ต่อเนื่องครบ ไม่มีรู | offset **4** (= 3+1) |
+| Pod 1 | P0 | 3⏳ 4✓ 5✓ | เจอ 3 Pending → STOP | offset **3** (4,5 ที่เสร็จต้องรอ) |
+| Pod 2 | P1 | 2⏳ 3⏳ | เจอ 2 Pending → STOP | offset **2** (ไม่ขยับ) |
+| Pod 4 | — | — | IDLE รอ rebalance | — |
+
+**Pod 1 = ตัวอย่าง sequential commit เป๊ะ** — offset 4,5 process เสร็จแล้ว แต่ commit ไม่ได้เพราะ offset 3 ยัง Pending ต้องรอ 3 เสร็จก่อนถึงกระโดดยาว (ห้ามข้ามรูโหว่)
+
+> ยืนยันอีกครั้ง: committed offset = "offset ตัวถัดไปที่จะอ่าน" ไม่ใช่ตัวล่าสุดที่ process (Pod 3 process ถึง offset 3 → commit `4`) — ตรงกับ §7 ข้อ 2
+
+### 8.3 หลาย consumer group อ่าน topic เดียวกัน (กฎข้อ 5)
+
+```
+Topic local_topic
+ ├─▶ Group local_cg     (งานหลัก — 4 pod)
+ ├─▶ Group analytics_cg (เก็บสถิติ — 2 consumer, ตัวนึงถือ 2 partition)
+ └─▶ Group backup_cg    (สำรอง — 1 consumer ถือทั้ง 3 partition)
+```
+
+ทั้ง 3 group อ่าน message ครบทุกตัวเหมือนกัน แต่จำ offset แยกกัน — order 1 ใบถูกประมวลผลโดยทั้ง 3 บทบาทพร้อมกัน (นี่คือหัวใจ event-driven) `backup_cg` ที่ `lastCommitted == maxReceived` ทุก partition = ตามทันงานหมดแล้ว ไม่มีค้าง
+
+### 8.4 สิ่งที่ต้องปรับในโค้ดเพื่อรองรับหลาย partition
+
+โค้ดปัจจุบันยังรองรับ partition เดียว จุดที่ต้องแก้:
+
+1. **`tp := kafka.TopicPartition{..., Partition: 0}`** — hardcode partition 0 อยู่ ต้องเปลี่ยนให้ทำงานกับทุก partition ที่ถูก assign (ดูจาก `Assignment()`)
+2. **`msgsStateMap map[kafka.Offset]bool`** — เป็น map รวมตัวเดียว ปัญหาคือ offset 3 ของ P0 จะชนกับ offset 3 ของ P1 ต้องเปลี่ยนเป็น **per-partition state** เช่น `map[int32]map[kafka.Offset]bool` (partition → offset → done) หรือสร้าง struct `PartitionState` แยกต่อ partition
+3. **`lastCommited` / `maxReceived`** — ต้องแยกต่อ partition เช่นกัน (แต่ละ partition มีตำแหน่ง commit ของตัวเอง)
+4. **`commitOffsetLoop`** — ต้อง scan + commit แยกต่อ partition (วนทุก partition ที่ถือ แล้ว commit รายตัว)
+5. **rebalance handler** — เมื่อ partition ถูกแจกใหม่ (pod เพิ่ม/หาย) ต้องจัดการ state ของ partition ที่ได้รับ/เสียไป
+
+นี่คือทิศทางการโตของโปรเจกต์ — โครงสร้าง `PartitionState` ต่อ partition คือหัวใจที่ทำให้ scale ได้ตามภาพ §8.2
