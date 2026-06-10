@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -23,14 +22,10 @@ type Server struct {
 
 func NewServer(eventRepo *repo.EventRepo) *Server {
 	msgCH := make(chan *shared.Message, 64)
-	c, err := consumer.NewKafkaConsumer(msgCH)
-
-	if err != nil {
-		panic(err)
-	}
+	c := consumer.NewKafkaConsumer(msgCH) // คืนค่าเดียว ไม่มี err แล้ว
 
 	return &Server{
-		producer:  producer.NewKafkaProducer(""),
+		producer:  producer.NewKafkaProducer(), // ไม่รับ arg แล้ว
 		consumer:  c,
 		msgCH:     msgCH,
 		eventRepo: eventRepo,
@@ -50,7 +45,7 @@ func (s *Server) produceMsg() {
 			fmt.Printf("error marshalling event = %v\n", err)
 			continue
 		}
-		s.producer.Producer(string(payload))
+		s.producer.Produce(payload) // Produce รับ []byte ตรงๆ (payload เป็น []byte อยู่แล้ว)
 	}
 }
 
@@ -63,15 +58,13 @@ func (s *Server) handleMsg(msg *shared.Message) {
 // 2. do we lock db, higher isolation level -> No
 // 3. ctx + tx -> YES
 func (s *Server) saveToDB(ctx context.Context, msg *shared.Message) {
-	repo.TxClosure(ctx, s.eventRepo, func(ctx context.Context, tx *sqlx.Tx) (string, error) {
+	_, err := repo.TxClosure(ctx, s.eventRepo, func(ctx context.Context, tx *sqlx.Tx) (string, error) {
 		fmt.Printf("starting DB operation for OFFSET = %d EventID = %s\n", msg.Metadata.Offset, msg.Event.EventId)
-		// TODO -> how to handle insert error
-		defer s.consumer.MarkAsComplete(msg.Metadata)
 
 		event := s.eventRepo.Get(ctx, tx, msg.Event.EventId)
 		if event != nil {
-			eMsg := fmt.Sprintf("offset = %d, eventID %s already existing -> skipping \n", msg.Metadata.Offset, msg.Event.EventId)
-			return "", errors.New(eMsg)
+			// เคย process แล้ว (idempotent) — ข้าม แต่ถือว่าสำเร็จ
+			return "", nil
 		}
 
 		id, err := s.eventRepo.Insert(ctx, tx, msg.Event)
@@ -82,6 +75,13 @@ func (s *Server) saveToDB(ctx context.Context, msg *shared.Message) {
 		fmt.Printf("INSERT SUCCESS, EventID = %s, Offset = %d\n", id, msg.Metadata.Offset)
 		return id, nil
 	})
+
+	// อัปเดต state ตามผลจริง → ให้ commit loop รู้ว่า offset นี้จบยังไง (Success/Error)
+	if err != nil {
+		s.consumer.UpdateState(msg.Metadata, consumer.MsgState_Error)
+		return
+	}
+	s.consumer.UpdateState(msg.Metadata, consumer.MsgState_Success)
 }
 
 func main() {
@@ -92,9 +92,10 @@ func main() {
 	er := repo.NewEventRepo(db)
 	s := NewServer(er)
 
+	go s.consumer.RunConsumer() // เริ่ม consumeLoop + checkReadyToAccept (เดิม constructor ทำให้ ตอนนี้ต้องเรียกเอง)
 	go s.produceMsg()
+
 	for msg := range s.msgCH {
 		go s.handleMsg(msg)
 	}
-
 }

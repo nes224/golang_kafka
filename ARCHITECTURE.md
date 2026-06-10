@@ -2,7 +2,9 @@
 
 เอกสารนี้อธิบายว่าโปรเจกต์นี้ทำงานยังไง (mechanics) และจะ **สร้างขึ้นใหม่ตั้งแต่ศูนย์** ได้ยังไง
 
-> สรุปสั้น: ระบบจำลอง event pipeline — producer ยิง event ทุกวินาทีเข้า Kafka → consumer อ่านมา process แบบขนาน (goroutine) → เขียนลง PostgreSQL ใน transaction (idempotent) → commit offset แบบ **sequential** (ปลอดภัยต่อ crash) ทุก 15 วินาที
+> สรุปสั้น: producer ยิง event ทุกวินาทีเข้า Kafka (4 partition) → consumer ที่ **รองรับ rebalance** อ่านมา process แบบขนาน (goroutine) → เขียนลง PostgreSQL ใน transaction (idempotent) → commit offset แบบ **sequential ต่อ partition** ทุก 10 วินาที → รันหลาย instance พร้อมกันได้ (scale)
+
+> เอกสารชุดเดียวกัน: `CODE_WALKTHROUGH.md` (โค้ดทีละบรรทัด), `MESSAGE_LIFECYCLE.md` (flow), `REBALANCE.md` (rebalance เชิงลึก), `LEARNING_ROADMAP.md` (ก้าวต่อไป), `KAFKA_GLOSSARY.md` (คำศัพท์)
 
 ---
 
@@ -21,18 +23,19 @@
 
 ## 1. ภาพรวมระบบ
 
-โปรเจกต์เป็น Go application ตัวเดียวที่รันทั้ง producer และ consumer พร้อมกัน เพื่อสาธิตกลไกหลักของ Kafka:
+Go application ตัวเดียวที่รันทั้ง producer และ consumer พร้อมกัน สาธิตกลไก Kafka ระดับ production:
 
-- **Producer** สร้าง `Event` ใหม่ทุก 1 วินาที → marshal เป็น JSON → ยิงเข้า topic `local_topic`
-- **Consumer** อ่าน message → แตก goroutine ประมวลผลแต่ละตัว (async) → เขียนลง DB
-- **Commit** ไม่ใช้ auto-commit แต่เขียน loop เอง commit แบบ sequential ทุก 15 วินาที เพื่อกัน message หายตอน crash
+- **Producer** สร้าง `Event` ใหม่ทุก 1 วินาที → marshal JSON → ยิงเข้า topic (4 partition)
+- **Consumer** รองรับ **rebalance** — อ่าน message → เก็บ state **แยกต่อ partition** → process แบบขนาน
+- **Commit** ปิด auto-commit, ใช้ **sequential commit ต่อ partition** (commit loop แยกแต่ละ partition) ทุก 10 วินาที
+- **Rebalance** — เปิดหลาย instance พร้อมกันได้ Kafka แจก partition ให้แต่ละตัว และ commit ก่อนปล่อย partition ตอนถูกยึด
 
-โครงสร้างพึ่งพา (dependency):
+dependency:
 
 ```
 Kafka (KRaft, docker)      ← message broker
 PostgreSQL (docker/local)  ← เก็บ event ที่ process แล้ว
-Go app                     ← producer + consumer ในตัวเดียว
+Go app                     ← producer + consumer (รันหลาย instance ได้)
 ```
 
 ---
@@ -40,41 +43,47 @@ Go app                     ← producer + consumer ในตัวเดีย�
 ## 2. Data Flow
 
 ```
-┌───────────────┐  ทุก 1 วิ          ┌──────────────────┐
-│  produceMsg   │  NewEvent()        │   KAFKA TOPIC    │
-│  (goroutine)  │ ─marshal JSON──▶   │   "local_topic"  │
-└───────────────┘   Producer()       │   [0][1][2]...   │
-                                      └────────┬─────────┘
-                                               │ ReadMessage()
+┌───────────────┐  ทุก 1 วิ           ┌──────────────────────┐
+│  produceMsg   │  NewEvent()         │   KAFKA TOPIC        │
+│  (goroutine)  │ ─marshal JSON──▶    │ local_topic_sticky1  │
+└───────────────┘  Produce([]byte)    │  4 partitions        │
+                                       └──────────┬───────────┘
+                                                  │ ReadMessage()
+                                                  ▼
+                                       ┌──────────────────────┐
+                                       │  consumeLoop          │ (RunConsumer)
+                                       │  - appendMsgState     │ → state[offset]=Pending (per-partition)
+                                       │  - NewMessage()       │ → unmarshal JSON เป็น Event
+                                       └──────────┬────────────┘
+                                                  │ MsgCH <- msg (select + timeout 5s)
+                                                  ▼
+                              ┌────────────────────────────────────┐
+                  main loop:  │  for msg := range s.msgCH           │
+                              │      go s.handleMsg(msg)            │ ← fan-out ขนาน
+                              └────────────────┬───────────────────┘
                                                ▼
-                                      ┌──────────────────┐
-                                      │   readMsgLoop    │  (goroutine)
-                                      │  - appendMsgState│  → จด offset = false ใน stateMap
-                                      │  - NewMessage()  │  → unmarshal JSON เป็น Event
-                                      └────────┬─────────┘
-                                               │ msgCH <- payload
-                                               ▼
-                              ┌────────────────────────────────┐
-                  main loop:  │  for msg := range s.msgCH       │
-                              │      go s.handleMsg(msg)        │  ← fan-out ขนาน
-                              └────────────────┬───────────────┘
-                                               ▼
-                                      ┌──────────────────┐
-                                      │   saveToDB       │
-                                      │  TxClosure:      │
-                                      │   - Get (เช็คซ้ำ)│  ← idempotent
-                                      │   - Insert       │
-                                      │   - MarkAsComplete(offset) → stateMap[offset]=true
-                                      └──────────────────┘
+                                       ┌──────────────────────┐
+                                       │   saveToDB (TxClosure)│
+                                       │   - Get (เช็คซ้ำ)     │ ← idempotent
+                                       │   - Insert            │
+                                       └──────────┬────────────┘
+                                                  ▼
+                                       UpdateState(offset, Success/Error)  → state[offset] per-partition
 
-  ┌─────────────────────────────────────────────────────────┐
-  │  commitOffsetLoop (goroutine แยก) — ทุก 15 วิ            │
-  │   ส่อง stateMap → หา offset ต่อเนื่องสูงสุดที่ true ครบ   │
-  │   → CommitOffsets(...)                                    │
-  └─────────────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PartitionState.commitOffsetLoop — 1 goroutine ต่อ partition      │
+  │   ทุก 10 วิ: findLatestToCommit (scan lastCommitted→maxReceived)  │
+  │   เจอ Pending = หยุด → CommitOffsets ของ partition นั้น           │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  rebalanceCB — เมื่อ Kafka แจก partition ใหม่                     │
+  │   Assigned → สร้าง PartitionState + เปิด commit loop             │
+  │   Revoked  → commit ค้างก่อน → หยุด loop → ปล่อย partition       │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-จุดสำคัญ: การ **อ่าน** (readMsgLoop), การ **process** (handleMsg goroutine), และการ **commit** (commitOffsetLoop) ทำงานแยกกัน 3 เส้น ไม่บล็อกกัน เชื่อมกันผ่าน `msgCH` (channel) และ `msgsStateMap` (shared state ที่ป้องกันด้วย mutex)
+การ **อ่าน** (consumeLoop), การ **process** (handleMsg goroutine), การ **commit** (commit loop ต่อ partition), และ **rebalance** (callback) ทำงานแยกกัน เชื่อมผ่าน `MsgCH` (channel) และ `msgsStateMap` (per-partition state + mutex/atomic)
 
 ---
 
@@ -83,24 +92,24 @@ Go app                     ← producer + consumer ในตัวเดีย�
 ```
 golang_kafka/
 ├── cmd/
-│   └── main.go                  ← entry point: ประกอบทุกอย่าง + รัน loop หลัก
+│   └── main.go                   ← entry point: ประกอบ + รัน (RunConsumer + produce + handle)
 ├── internal/
 │   ├── shared/
-│   │   ├── kafka-config.go       ← config กลาง (topic, group, host)
-│   │   └── types.go              ← Message struct + NewMessage (unmarshal)
+│   │   ├── kafka-config.go        ← config (topic, group, host, strategy, num partitions)
+│   │   └── types.go               ← Message struct + NewMessage (unmarshal)
 │   ├── producer/
-│   │   └── producer.go           ← ห่อ kafka.Producer
+│   │   └── producer.go            ← ห่อ kafka.Producer
 │   ├── consumer/
-│   │   └── consumer.go           ← ห่อ kafka.Consumer + sequential commit
+│   │   ├── consumer.go            ← ห่อ kafka.Consumer + rebalance + read loop
+│   │   └── parition-state.go      ← PartitionState + commit loop (ต่อ partition)  ★ใหม่
 │   └── repo/
-│       ├── db.go                 ← เชื่อม PostgreSQL (sqlx) + util
-│       └── event-repo.go         ← Event struct + CRUD + TxClosure
-├── kafka.yaml                    ← docker compose (Kafka KRaft + kafdrop)
+│       ├── db.go                  ← เชื่อม PostgreSQL (sqlx) + util
+│       ├── event-repo.go          ← Event + CRUD + TxClosure
+│       └── repo-err.go            ← ตรวจ duplicate key error  ★ใหม่
+├── kafka.yaml                     ← docker compose (Kafka KRaft + kafdrop)
 ├── Makefile
-└── go.mod                        ← module: github.com/golang_kafka
+└── go.mod                         ← module: github.com/golang_kafka
 ```
-
-หลักการ: `internal/` แยกตามความรับผิดชอบ — producer/consumer ห่อ Kafka, repo ห่อ DB, shared เป็นของกลาง, cmd แค่ประกอบ
 
 ---
 
@@ -109,325 +118,187 @@ golang_kafka/
 ### 4.1 `shared/kafka-config.go` — config กลาง
 
 ```go
+type KafkaPartitionStrategies string
+const (
+    CooperativeStickyStrategy KafkaPartitionStrategies = "cooperative-sticky"
+    RoundRobin                KafkaPartitionStrategies = "roundrobin"
+)
+
 type KafkaConfig struct {
-    Topic         string
-    ConsumerGroup string
-    Host          string
+    DefaultTopic             string                    // "local_topic_sticky1"
+    Host                     string                    // "localhost"
+    ConsumerGroup            string                    // "local_cg1"
+    ParititionAssignStrategy KafkaPartitionStrategies  // cooperative-sticky
+    NumPartitions            int                       // 4
 }
-// Topic: "local_topic", ConsumerGroup: "local_cg", Host: "localhost"
 ```
 
-แหล่งความจริงเดียว (single source of truth) — producer/consumer ดึงค่าจากที่นี่ทั้งคู่ แก้ที่เดียวมีผลทั้งระบบ
+เพิ่ม **strategy** (วิธีแจก partition ตอน rebalance) และ **NumPartitions: 4** (เปิดให้ขนานได้จริงระดับ partition ไม่ใช่แค่ goroutine)
 
 ### 4.2 `shared/types.go` — สัญญารูปแบบ message
 
 ```go
 type Message struct {
-    Metadata *kafka.TopicPartition  // topic/partition/offset ของ message นี้
+    Metadata *kafka.TopicPartition  // topic/partition/offset (ใช้ตอน commit + UpdateState)
     Event    *repo.Event            // เนื้อหาที่ unmarshal แล้ว
 }
-
-func NewMessage(metadata *kafka.TopicPartition, data []byte) *Message {
-    e := &repo.Event{}
-    json.Unmarshal(data, e)   // byte → Event
-    return &Message{Metadata: metadata, Event: e}
-}
+func NewMessage(metadata, data []byte) *Message { /* json.Unmarshal → Event */ }
 ```
 
-`Message` มัด 2 อย่างเข้าด้วยกัน: **metadata** (ใช้ตอน commit — ต้องรู้ offset) + **event** (เนื้อหาจริงที่ไป process). นี่คือเหตุผลที่ producer ต้องส่ง JSON ของ `Event` ไม่ใช่ plain text — ไม่งั้น `json.Unmarshal` ตรงนี้พัง
+ไม่เปลี่ยนจากเดิม — `Metadata` สำคัญขึ้นเพราะตอนนี้ใช้ระบุ partition+offset ใน `UpdateState`
 
 ### 4.3 `producer/producer.go` — ฝั่งยิง
 
 ```go
-func NewKafkaProducer(topic string) *KafkaProducer {
-    p, _ := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": cfg.Host})
-    // ❌ ห้าม defer p.Close() ตรงนี้ — constructor return ปุ๊บ producer ปิดทันที
-
-    go func() {                          // delivery report handler
-        for e := range p.Events() {
-            // log ว่า message ส่งถึง Kafka สำเร็จ/ล้มเหลว
-        }
-    }()
-    return &KafkaProducer{producer: p, topic: topic}
-}
-
-func (p *KafkaProducer) Producer(msg string) {
-    p.producer.Produce(&kafka.Message{
-        TopicPartition: kafka.TopicPartition{Topic: &p.topic, Partition: kafka.PartitionAny},
-        Value:          []byte(msg),
-    }, nil)
-}
+func NewKafkaProducer() *KafkaProducer { … }     // ไม่รับ arg แล้ว (ดึง topic จาก config)
+func (p *KafkaProducer) Produce(msg []byte) { … } // ชื่อ Produce, รับ []byte
 ```
 
-- **delivery report goroutine** — `Produce()` เป็น async (โยน message เข้า queue แล้ว return เลย) ผลลัพธ์การส่งจริงมาทาง `p.Events()` ทีหลัง goroutine นี้คอยฟัง
-- **`PartitionAny`** — ให้ Kafka เลือก partition เอง (ไม่ได้ระบุ key)
-- **`Close()`** ทำ `Flush(5000)` รอ message ค้างส่งให้หมดก่อนปิด — ไว้เรียกตอน shutdown
+- delivery report goroutine ยังอยู่ (log ผ่าน logrus พร้อม partition+offset)
+- `Produce` ใช้ `PartitionAny` → Kafka กระจาย message ไปทั้ง 4 partition เอง
 
-### 4.4 `consumer/consumer.go` — ฝั่งรับ + หัวใจของ sequential commit
+### 4.4 `consumer/consumer.go` — ฝั่งรับ + rebalance
 
-โครงสร้าง state สำคัญ:
+state แยกต่อ partition + enum:
 
 ```go
+type MsgState = int32
+const ( MsgState_Pending = iota; MsgState_Success; MsgState_Error )
+
 type KafkaConsumer struct {
-    Consumer     *kafka.Consumer
-    msgCH        chan *shared.Message
-    msgsStateMap map[kafka.Offset]bool   // offset → process เสร็จยัง (true/false)
-    lastCommited kafka.Offset            // commit ไปถึง offset ไหนแล้ว
-    maxReceived  *kafka.TopicPartition   // offset สูงสุดที่อ่านมา
-    mu           *sync.RWMutex           // ป้องกัน stateMap จากหลาย goroutine
-    commitDur    time.Duration           // 15 วินาที
+    consumer     *kafka.Consumer
+    ID           string                       // id สุ่ม (ดูตอนรันหลาย instance)
+    MsgCH        chan *shared.Message
+    mu           *sync.RWMutex
+    msgsStateMap map[int32]*PartitionState     // partition → state (แยกต่อ partition!)
+    commitDur    time.Duration                 // 10s
+    cfg          *shared.KafkaConfig
 }
 ```
 
-**config สำคัญ** — ปิด auto-commit:
-
+config สำคัญ:
 ```go
-kafka.NewConsumer(&kafka.ConfigMap{
-    "bootstrap.servers":  cfg.Host,
-    "group.id":           cfg.ConsumerGroup,
-    "enable.auto.commit": false,   // ← คุม commit เองทั้งหมด
-})
+"enable.auto.commit":              false,                // คุม commit เอง
+"auto.offset.reset":               "earliest",
+"go.application.rebalance.enable": true,                 // จัดการ rebalance เอง
+"partition.assignment.strategy":   "cooperative-sticky", // แจก partition แบบ incremental
 ```
 
-**ตอน start** — อ่าน committed offset เดิมมาเป็นจุดเริ่ม:
+method หลัก:
+- `RunConsumer()` — เปิด `checkReadyToAccept` + `consumeLoop` (ต้องเรียกจาก main)
+- `consumeLoop()` — อ่าน message → `appendMsgState` → `NewMessage` → ส่งเข้า `MsgCH` (select + timeout 5s กัน block)
+- `appendMsgState()` — `state[offset]=Pending` ใน PartitionState ของ partition นั้น + อัปเดต maxReceived (atomic)
+- `UpdateState(tp, newState)` — ตั้ง state เป็น Success/Error (เรียกจาก handler)
+- `rebalanceCB` → `assignPrntCB` / `revokePrtnCB` — จัดการตอน partition ถูกแจก/ยึด (ดู §5.5 + REBALANCE.md)
+
+### 4.5 `consumer/parition-state.go` — state + commit loop ต่อ partition ★
 
 ```go
-commited, _ := c.Committed([]kafka.TopicPartition{tp}, 5000)
-latestComm := commited[len(commited)-1].Offset   // เริ่มต่อจากที่เคย commit
-```
-
-มี 3 goroutine ทำงานพร้อมกัน:
-
-```go
-go consumer.commitOffsetLoop()   // commit ทุก 15 วิ
-go consumer.checkReadyToAccept() // เช็คว่าได้ partition แล้วยัง
-go consumer.readMsgLoop()        // อ่าน message
-```
-
-**`readMsgLoop`** — อ่านแล้วจด state + ส่งเข้า channel:
-
-```go
-for {
-    msg, err := c.Consumer.ReadMessage(time.Second)
-    if err != nil {
-        if kerr, ok := err.(kafka.Error); ok && kerr.IsTimeout() {
-            continue   // timeout = ปกติ ไม่มี message ช่วงนั้น
-        }
-        fmt.Printf("Consumer error: %v\n", err)
-        continue
-    }
-    c.appendMsgState(&msg.TopicPartition)        // จด offset = false (ยังไม่เสร็จ)
-    payload := shared.NewMessage(&msg.TopicPartition, msg.Value)
-    c.msgCH <- payload                            // โยนเข้า channel ให้ handler
+type PartitionState struct {
+    ID           int32
+    state        map[kafka.Offset]MsgState   // offset → สถานะ ของ partition นี้
+    maxReceived  *atomic.Int32
+    lastCommited *atomic.Int32
+    ctx, cancel  // ใช้สั่งหยุด loop ตอน revoke
+    exitCH       chan struct{}
 }
 ```
 
-**`appendMsgState` / `MarkAsComplete`** — จด/อัปเดต state (มี lock):
+- **1 PartitionState ต่อ 1 partition** — offset แต่ละ partition นับแยก เลยต้องแยก map
+- `commitOffsetLoop()` — ticker ทุก 10s → `findLatestToCommit` → `CommitOffsets`
+- `findLatestToCommit()` — scan `lastCommited`→`maxReceived` เจอ Pending = หยุด (sequential), Success/Error = ลบทิ้ง+ผ่าน
+- `ctx/cancel/exitCH` — ตอน revoke จะ `cancel()` แล้วรอ `<-exitCH` ให้ loop หยุดสนิทก่อน
+
+### 4.6 `repo/db.go` + `event-repo.go` — DB layer
 
 ```go
-func (c *KafkaConsumer) appendMsgState(tp *kafka.TopicPartition) {
-    c.mu.Lock(); defer c.mu.Unlock()
-    c.msgsStateMap[tp.Offset] = false            // เพิ่งอ่านมา ยังไม่ process
-    if c.maxReceived.Offset < tp.Offset {        // อัปเดต offset สูงสุด
-        c.maxReceived = ...tp...
-    }
-}
+import _ "github.com/lib/pq"                  // register driver "postgres"
+func NewDBConn() (*sqlx.DB, error) { sqlx.Connect("postgres", dsn) }
 
-func (c *KafkaConsumer) MarkAsComplete(tp *kafka.TopicPartition) {
-    c.mu.Lock(); defer c.mu.Unlock()
-    c.msgsStateMap[tp.Offset] = true             // process เสร็จแล้ว
+type Event struct { EventId; EventName; Timespamp }   // db tags
+func TxClosure[T any](ctx, r, fn) (T, error) { /* begin → defer commit/rollback/recover */ }
+```
+
+`TxClosure` = generic helper ครอบ transaction (recover → rollback, error → rollback, สำเร็จ → commit) — ไม่เปลี่ยนจากเดิม
+
+### 4.7 `repo/repo-err.go` — ตรวจ duplicate key ★
+
+```go
+func IsDuplicateKeyErr(err error) bool {
+    var pgErr *pq.Error
+    if errors.As(err, &pgErr) { return pgErr.Code == "23505" }  // PG: unique_violation
+    return false
 }
 ```
 
-**`commitOffsetLoop`** — หัวใจ sequential commit (ทุก 15 วิ):
+ตรวจว่า insert ชน unique constraint ไหม — ใช้ทำ idempotent แบบพึ่ง DB (insert ตรงๆ ถ้าซ้ำจับ error นี้) แทนการ `Get` ก่อน
 
-```go
-for offset := c.lastCommited; offset < c.maxReceived.Offset; offset++ {
-    completed, exists := c.msgsStateMap[offset]
-    if !exists { continue }
-    if completed {
-        delete(c.msgsStateMap, offset)   // เสร็จแล้ว เก็บกวาด
-        continue
-    }
-    // เจอตัวแรกที่ยัง false → หยุดตรงนี้ commit ได้แค่ถึงก่อนหน้า
-    latestToCommit.Offset = offset
-    break
-}
-c.Consumer.CommitOffsets([]kafka.TopicPartition{latestToCommit})
-```
-
-ตรรกะคือ ไล่จาก `lastCommited` ขึ้นไป เจอ offset แรกที่ยังไม่เสร็จ (`false`) ก็ commit ได้แค่ถึงตรงนั้น — **กระโดดข้ามรูโหว่ไม่ได้** (ดู §5.1)
-
-### 4.5 `repo/db.go` — เชื่อม PostgreSQL
-
-```go
-import _ "github.com/lib/pq"   // blank import: register driver "postgres"
-
-func NewDBConn() (*sqlx.DB, error) {
-    return sqlx.Connect("postgres", getDBConnString())
-}
-// conn string: host=localhost port=5433 user=alphamech password=... dbname=kafka_yt sslmode=disable
-```
-
-- **blank import `_`** — ต้องมีไม่งั้น `sqlx.Connect("postgres", ...)` จะ panic `unknown driver`. driver register ตัวเองผ่าน `init()` ตอนถูก import
-- `GenerateRandomString` — สร้าง event id แบบสุ่ม
-
-### 4.6 `repo/event-repo.go` — CRUD + transaction helper
-
-```go
-type Event struct {
-    EventId   string    `db:"event_id"`
-    EventName string    `db:"event_type"`
-    Timespamp time.Time `db:"timestamp"`
-}
-```
-
-**`TxClosure`** — generic helper ครอบ transaction ด้วย defer + recover:
-
-```go
-func TxClosure[T any](ctx, r, fn func(ctx, tx) (T, error)) (T, error) {
-    tx, _ := r.repo.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-    defer func() {
-        if r := recover(); r != nil { tx.Rollback(); panic(r) }  // panic → rollback
-        if err != nil { tx.Rollback(); return }                  // error → rollback
-        err = tx.Commit()                                         // สำเร็จ → commit
-    }()
-    res, err = fn(ctx, tx)
-    return res, err
-}
-```
-
-รูปแบบนี้ทำให้โค้ดที่เรียกใช้ไม่ต้องจัดการ begin/commit/rollback เอง — ส่ง closure เข้าไป ถ้า return error หรือ panic ก็ rollback อัตโนมัติ ถ้าสำเร็จก็ commit ให้
-
-**`Get` ก่อน `Insert`** = idempotent (ดู §5.2)
-
-### 4.7 `cmd/main.go` — ประกอบร่าง
+### 4.8 `cmd/main.go` — ประกอบร่าง
 
 ```go
 func main() {
     db, _ := repo.NewDBConn()
-    er := repo.NewEventRepo(db)
-    s := NewServer(er)              // สร้าง producer + consumer + msgCH
+    s := NewServer(repo.NewEventRepo(db))
 
-    go s.produceMsg()               // เริ่มยิง event
-    for msg := range s.msgCH {      // รับ message จาก consumer
-        go s.handleMsg(msg)         // แตก goroutine process แต่ละตัว (async)
+    go s.consumer.RunConsumer()    // ★ เริ่ม consumer loop (เดิม constructor ทำให้)
+    go s.produceMsg()              // ยิง event ทุกวิ
+    for msg := range s.msgCH {     // รับ → process ขนาน
+        go s.handleMsg(msg)
     }
 }
 ```
 
-`handleMsg` → `saveToDB` ครอบ `TxClosure` แล้ว `defer MarkAsComplete` (จด state ว่าเสร็จ ไม่ว่า insert ผ่านหรือ skip)
+`saveToDB` → `TxClosure` (Get→Insert) แล้ว `UpdateState(Success/Error)` ตามผล (duplicate = idempotent skip → Success)
 
 ---
 
 ## 5. กลไกสำคัญเชิงลึก
 
-### 5.1 Sequential commit — ทำไม commit ข้ามรูโหว่ไม่ได้
+### 5.1 Sequential commit (ต่อ partition)
 
-เพราะ process ทำแบบขนาน (goroutine) message เสร็จ **ไม่เรียงลำดับ** เช่น:
+process ขนาน → เสร็จไม่เรียงลำดับ committed offset เป็นเลขเดียวที่แปลว่า "ทุกตัวก่อนหน้าเสร็จหมด" จึง commit ได้แค่ offset ที่เสร็จ **ต่อเนื่องไม่มีรู** — เจอ Pending ตัวแรกก็หยุด ตอนนี้ทำ **แยกต่อ partition** (แต่ละ partition มี commit loop + lastCommitted ของตัวเอง)
 
-```
-offset:  0    1    2    3
-state:   ✓    ✓    ✗    ✓     (offset 2 ยังไม่เสร็จ)
-              ↑ commit ได้แค่ถึงนี่ (1) — offset 3 ที่เสร็จแล้วก็ต้องรอ
-```
+### 5.2 Idempotent consumer
 
-committed offset เป็น **เลขเดียว** ที่แปลว่า "ทุกตัวก่อนหน้าเสร็จหมดแล้ว" ถ้า commit 3 ทั้งที่ 2 ยังไม่เสร็จ แล้ว crash → restart มาอ่านที่ 4 → **offset 2 หายตลอดกาล**
+at-least-once → message อาจถูกอ่านซ้ำ → `Get` ก่อน `Insert` (หรือ `IsDuplicateKeyErr`) กันทำซ้ำ — duplicate ถือว่าสำเร็จ (เคยทำแล้ว)
 
-เลยต้อง commit แค่ offset ที่เสร็จ **ต่อเนื่องกันโดยไม่มีรู** พอ 2 เสร็จค่อยกระโดดยาวถึง 3
+### 5.3 Manual commit
 
-### 5.2 Idempotent consumer — กันทำซ้ำ
+`enable.auto.commit: false` คุม commit เองหลัง process เสร็จจริง (กัน message หายแบบ at-most-once)
 
-เพราะใช้ **at-least-once** (process ก่อน → commit ทีหลัง) message อาจถูกอ่านซ้ำได้ตอน crash ก่อน commit เลยต้องเช็คก่อนทำ:
+### 5.4 Mutex + Atomic
 
-```go
-event := s.eventRepo.Get(ctx, tx, msg.Event.EventId)
-if event != nil {
-    return "", errors.New("already existing -> skipping")  // เคยทำแล้ว ข้าม
-}
-id, err := s.eventRepo.Insert(ctx, tx, msg.Event)
-```
+`msgsStateMap` ถูกแตะหลาย goroutine → `sync.RWMutex` ป้องกัน ส่วน `maxReceived`/`lastCommited` ใช้ `atomic.Int32` (เร็วกว่า lock สำหรับ counter เดี่ยว)
 
-`event_id` เป็น primary key → ถ้ามีอยู่แล้วก็ไม่ insert ซ้ำ ทำให้ process ตัวเดิมกี่ครั้งผลก็เหมือนเดิม
+### 5.5 Rebalance — commit ก่อน revoke
 
-### 5.3 Manual commit แทน auto-commit
-
-`enable.auto.commit: false` — ปิดการ commit อัตโนมัติทั้งหมด เพราะ auto-commit (default ทุก 5 วิ) อาจ commit ก่อน process เสร็จ → ถ้า crash จะ message หาย (at-most-once) โค้ดนี้เลยคุม commit เองผ่าน `commitOffsetLoop` ให้ commit หลังยืนยันว่า process เสร็จจริง
-
-### 5.4 ทำไมต้อง mutex
-
-`msgsStateMap` ถูกแตะจากหลาย goroutine พร้อมกัน — `readMsgLoop` (เขียน false), `handleMsg` หลายตัว (`MarkAsComplete` เขียน true), `commitOffsetLoop` (อ่าน + ลบ) map ใน Go ไม่ thread-safe เขียนพร้อมกันจะ panic เลยต้องล็อกด้วย `sync.RWMutex`
+เปิดหลาย instance → Kafka แจก partition ให้แต่ละตัว ตอน partition ถูกยึดคืน (revoke) ต้อง **commit offset ที่ค้างก่อนปล่อย** ไม่งั้น instance ใหม่อ่านซ้ำเยอะ ใช้ **cooperative-sticky** (แจกแบบ incremental — ปล่อยเฉพาะ partition ที่ต้องย้าย ตัวอื่นทำงานต่อ ลด downtime) — รายละเอียดเต็มใน `REBALANCE.md`
 
 ---
 
 ## 6. Rebuild from scratch
 
-ทำตามลำดับนี้สร้างใหม่ได้ทั้งระบบ
-
 ### Step 0 — Prerequisites
-
-- Go 1.18+ (ใช้ generics ใน `TxClosure`)
-- Docker + Docker Compose
-- `librdkafka` — confluent-kafka-go ต้องการ C library นี้ (macOS: `brew install librdkafka`)
+Go 1.18+ (generics), Docker, `librdkafka` (macOS: `brew install librdkafka`)
 
 ### Step 1 — init module
-
 ```bash
-mkdir golang_kafka && cd golang_kafka
 go mod init github.com/golang_kafka
 ```
 
-### Step 2 — ติดตั้ง dependencies
-
+### Step 2 — dependencies
 ```bash
 go get github.com/confluentinc/confluent-kafka-go/v2/kafka
-go get github.com/jmoiron/sqlx
-go get github.com/lib/pq
-go get github.com/sirupsen/logrus
+go get github.com/jmoiron/sqlx github.com/lib/pq github.com/sirupsen/logrus
 ```
 
-### Step 3 — ตั้ง Kafka (KRaft) ด้วย Docker
-
-สร้าง `kafka.yaml` (KRaft mode — ไม่ต้องมี ZooKeeper):
-
-```yaml
-services:
-  kafka:
-    image: confluentinc/cp-kafka:latest
-    container_name: kafka
-    hostname: kafka
-    ports:
-      - "9092:9092"
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: "broker,controller"
-      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
-      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
-      KAFKA_LISTENERS: "CONTROLLER://:29093,PLAINTEXT_INTERNAL://:29092,PLAINTEXT://:9092"
-      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT"
-      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
-      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT_INTERNAL"
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_NUM_PARTITIONS: 4
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-  kafdropui:
-    image: obsidiandynamics/kafdrop
-    ports: ["9090:9000"]
-    environment:
-      KAFKA_BROKERCONNECT: "kafka:29092"
-    depends_on: [kafka]
-```
-
+### Step 3 — Kafka KRaft (docker)
+ใช้ `kafka.yaml` (KRaft mode — ดูไฟล์จริงในโปรเจกต์) แล้ว:
 ```bash
-docker-compose -f kafka.yaml up -d
-# เปิด kafdrop ดู topic ได้ที่ http://localhost:9090
+docker-compose -f kafka.yaml up -d   # kafdrop ดูที่ http://localhost:9090
 ```
 
-### Step 4 — ตั้ง PostgreSQL + สร้างตาราง
-
-ต่อ DB (port 5433, dbname `kafka_yt`) แล้วสร้างตาราง:
-
+### Step 4 — PostgreSQL + ตาราง
 ```sql
 CREATE TABLE IF NOT EXISTS events (
     event_id   TEXT PRIMARY KEY,
@@ -437,53 +308,37 @@ CREATE TABLE IF NOT EXISTS events (
 ```
 
 ### Step 5 — เขียนโค้ดตามลำดับ
-
-1. `internal/shared/kafka-config.go` — config
-2. `internal/repo/db.go` + `event-repo.go` — DB layer (อย่าลืม blank import `_ "github.com/lib/pq"`)
-3. `internal/shared/types.go` — `Message` + `NewMessage`
-4. `internal/producer/producer.go` — producer (อย่า `defer p.Close()` ใน constructor)
-5. `internal/consumer/consumer.go` — consumer + commit loop
-6. `cmd/main.go` — ประกอบ
+1. `shared/kafka-config.go` (topic, group, strategy=cooperative-sticky, NumPartitions=4)
+2. `repo/db.go` + `event-repo.go` + `repo-err.go` (blank import `_ "github.com/lib/pq"`)
+3. `shared/types.go`
+4. `producer/producer.go`
+5. `consumer/parition-state.go` → `consumer/consumer.go`
+6. `cmd/main.go` (เรียก `RunConsumer()`)
 
 ### Step 6 — รัน
-
 ```bash
-go run ./cmd
-# หรือผ่าน Makefile:
-make app
+go run ./cmd          # หรือ make app
 ```
-
-ควรเห็น log: topic created → `Delivered message` → `MarkAsComplete` → `Commited on CRON` ทุก 15 วิ
+ลองเปิด 2 terminal พร้อมกันเพื่อทดสอบ rebalance — จะเห็น log `✅ Assigned` / `❌ Revoking`
 
 ---
 
 ## 7. ข้อควรระวัง / Known issues
 
-จุดที่สังเกตเห็นจากโค้ดปัจจุบัน — ควรเก็บก่อนเอาไป production:
+**สิ่งที่แก้ไปแล้ว** (จาก rebalance refactor): per-partition state ✓, state เป็น enum ✓, multi-partition ✓, regex topic ถอดออก ✓, `topic` field ตั้งถูก ✓, deadlock ใน commit loop หายไป (commit loop ย้ายไป PartitionState ไม่มี lock ค้างแล้ว) ✓, `lastCommited = offset-1` ยืนยันว่า**ตั้งใจ** (committed offset = ตัวถัดไปที่จะอ่าน) ✓
 
-**1. `commitOffsetLoop` เสี่ยง deadlock** — ใน `select { case <-ticker.C: }` มีการ `c.mu.Lock()` แล้วบาง path `continue` โดยยังไม่ `Unlock()`:
-- บรรทัด `if c.maxReceived == nil { continue }` — ถือ lock อยู่แล้ว continue
-- บรรทัด `if c.lastCommited == c.maxReceived.Offset { ...; continue }` — เหมือนกัน
+**ที่ยังเหลือ:**
 
-รอบ ticker ถัดไปจะ `Lock()` อีกครั้งบน lock ที่ยังไม่ปลด → ค้าง path ที่สองเข้าได้จริงเมื่อไม่มี message ใหม่เข้ามาช่วงนั้น ควรย้าย `Unlock` ให้ครอบทุก exit path (หรือใช้ closure + defer)
-
-**2. `lastCommited = latestToCommit.Offset - 1`** — ตรรกะ offset ลบ 1 ตรงนี้ดูแปลก ควร trace ให้แน่ใจว่า committed position ตรงกับที่ตั้งใจ (Kafka commit คือ offset ของ "ตัวถัดไปที่จะอ่าน" ไม่ใช่ตัวล่าสุดที่อ่าน)
-
-**3. มี partition เดียว** — `NumPartitions: 1` ตอนสร้าง topic ทำให้ขนานได้จริงแค่ระดับ goroutine ไม่ใช่ระดับ partition และ commit logic เขียนเผื่อ partition 0 ตัวเดียว ยังไม่รองรับหลาย partition
-
-**4. `"^aRegex.*[Tt]opic"`** — subscribe regex topic ที่ไม่มีจริง ทำให้ขึ้น log `Subscribed topic not available` รก log เฉยๆ ลบได้ถ้าไม่ใช้
-
-**5. ยังไม่มี graceful shutdown** — `exitCH` ถูกสร้างแต่ไม่มีใคร close, producer `Close()` ไม่ถูกเรียก กด Ctrl+C อาจมี message ค้างหรือ commit ไม่ทัน ควรเพิ่ม signal handler
-
-**6. `field topic: cfg.ConsumerGroup`** — ใน consumer struct เซ็ต `topic` เป็นค่า ConsumerGroup (ดูเหมือนพิมพ์สลับ) แต่ field นี้ไม่ถูกใช้ที่ไหน เลยไม่กระทบการทำงาน
-
-**7. `Event.Timespamp`** — สะกดผิด (ควรเป็น Timestamp) แต่ db tag ถูก (`timestamp`) เลยทำงานได้ปกติ แก้ชื่อ field ทีหลังได้
+1. **ยังไม่มี graceful shutdown** — `RunConsumer` block ที่ `<-exitCH` แต่ไม่มี signal handler (SIGINT/SIGTERM) → กด Ctrl+C ตอนนี้ producer ไม่ Flush, commit loop อาจถูกตัดกลางคัน
+2. **`Event.Timespamp`** — สะกดผิด (ควร Timestamp) แต่ db tag ถูก เลยทำงานได้
+3. **MsgCH block 5 วิ → drop เป็น Error** — `consumeLoop` ถ้า channel เต็มเกิน 5 วิ จะ drop message (`UpdateState Error`) — ป้องกัน deadlock แต่หมายถึง message นั้นจะถูก skip (ไม่ได้ process จริง) ควรมี retry/DLQ
+4. **Replication factor = 1** — broker เดียว ตาย = ข้อมูลหาย (production ต้อง ≥3)
+5. **ไม่มี retry / DLQ** — Error state แค่ปล่อยผ่าน commit ไม่มีการลองใหม่หรือเก็บไว้ที่อื่น
+6. **DB credential hardcode ใน `db.go`** — ต้องย้ายไป env/secret ก่อน production
 
 ---
 
 ## 8. Scaling to production
-
-โค้ดปัจจุบันเป็นเวอร์ชัน **1 partition / 1 consumer** ส่วนนี้อธิบายว่าระบบจะหน้าตาเป็นยังไงเมื่อ scale ขึ้นจริง (หลาย partition + หลาย pod + หลาย consumer group) และต้องปรับโค้ดอะไรบ้าง
 
 ### 8.1 กฎ partition + consumer group (5 ข้อ)
 
@@ -495,42 +350,70 @@ make app
 5. คนละ consumer group อ่าน partition เดียวกันได้อิสระ (ต่างคนต่างจำ offset)
 ```
 
-> offset นับแยกต่อ partition — P0 มี offset 0,1,2… และ P1 ก็มี 0,1,2… เป็นคนละชุดกัน ระบุ message 1 ชิ้นต้องใช้ `topic + partition + offset`
+### 8.2 สถานะปัจจุบัน — implement ไปถึงไหนแล้ว
 
-### 8.2 ภาพ scale: topic 3 partition + group `local_cg` (4 pod)
+| ความสามารถ | สถานะ |
+|---|---|
+| Per-partition state | ✅ `PartitionState` ต่อ partition |
+| Multi-partition (4) | ✅ `NumPartitions: 4` |
+| Rebalance (assign/revoke) | ✅ `rebalanceCB` + commit-before-revoke |
+| Cooperative-sticky | ✅ incremental assign/unassign |
+| รันหลาย instance | ✅ เปิดหลาย process แล้ว Kafka แจก partition ให้ |
+| Multi-broker / HA | ❌ ยัง 1 broker (RF=1) |
+| DLQ / retry | ❌ ยังไม่มี |
 
-3 partition แจกให้ 3 pod, pod ที่ 4 ว่างงาน (กฎข้อ 4) แต่ละ pod ถือ **PartitionState** ของตัวเอง (= `lastCommitted` + `maxReceived` + `msgsStateMap` ใน struct `KafkaConsumer`) และรัน `commitOffsetLoop` แยกกัน:
+โค้ดตอนนี้ scale ระดับ "หลาย consumer instance" ได้แล้ว (ดูรายละเอียด rebalance ใน `REBALANCE.md`) ที่เหลือคือ infra (multi-broker) + resilience (DLQ/retry) ตาม `LEARNING_ROADMAP.md` Phase 2-3
 
-| Pod | partition | msgsStateMap | scan เจออะไร | commit ถึง |
-|---|---|---|---|---|
-| Pod 3 | P2 | 1✓ 2✓ 3✓ | ต่อเนื่องครบ ไม่มีรู | offset **4** (= 3+1) |
-| Pod 1 | P0 | 3⏳ 4✓ 5✓ | เจอ 3 Pending → STOP | offset **3** (4,5 ที่เสร็จต้องรอ) |
-| Pod 2 | P1 | 2⏳ 3⏳ | เจอ 2 Pending → STOP | offset **2** (ไม่ขยับ) |
-| Pod 4 | — | — | IDLE รอ rebalance | — |
+### 8.3 Scale in / Scale out (k8s ↔ Kafka)
 
-**Pod 1 = ตัวอย่าง sequential commit เป๊ะ** — offset 4,5 process เสร็จแล้ว แต่ commit ไม่ได้เพราะ offset 3 ยัง Pending ต้องรอ 3 เสร็จก่อนถึงกระโดดยาว (ห้ามข้ามรูโหว่)
+**Scale out** = เพิ่ม instance (k8s เพิ่ม replicas) · **Scale in** = ลด instance (ลด replicas)
 
-> ยืนยันอีกครั้ง: committed offset = "offset ตัวถัดไปที่จะอ่าน" ไม่ใช่ตัวล่าสุดที่ process (Pod 3 process ถึง offset 3 → commit `4`) — ตรงกับ §7 ข้อ 2
+ทั้ง 3 ส่วน scale ไม่เหมือนกัน:
 
-### 8.3 หลาย consumer group อ่าน topic เดียวกัน (กฎข้อ 5)
+| ส่วน | scale ยังไง | = k8s replicas? | เกี่ยว rebalance? |
+|---|---|---|---|
+| **Producer** | เพิ่ม pod กี่ตัวก็ได้ ทุกตัวยิงเข้า topic เดียวกัน | ✅ ใช่ | ❌ ไม่ (producer ไม่มี group) |
+| **Consumer** | เพิ่ม/ลด pod → Kafka แจก partition ใหม่ | ✅ ใช่ | ✅ ใช่ (หัวใจ) |
+| **Partition** | แก้ config ที่ Kafka (เพิ่มได้/ลดไม่ได้) | ❌ **ไม่ใช่** | เป็น "เพดาน" |
+
+**สำคัญ: Partition ≠ k8s replicas** — partition คือ config ของ topic ฝั่ง Kafka ไม่ได้ผูกกับ pod มันคือ **"จำนวนเลน" ตายตัว = เพดานของ consumer ที่ขนานได้**
 
 ```
-Topic local_topic
- ├─▶ Group local_cg     (งานหลัก — 4 pod)
- ├─▶ Group analytics_cg (เก็บสถิติ — 2 consumer, ตัวนึงถือ 2 partition)
- └─▶ Group backup_cg    (สำรอง — 1 consumer ถือทั้ง 3 partition)
+topic มี 4 partition
+ → scale consumer ได้สูงสุด 4 pod (ทำงานจริง)
+ → pod ที่ 5, 6... = IDLE (กฎข้อ 4)
 ```
 
-ทั้ง 3 group อ่าน message ครบทุกตัวเหมือนกัน แต่จำ offset แยกกัน — order 1 ใบถูกประมวลผลโดยทั้ง 3 บทบาทพร้อมกัน (นี่คือหัวใจ event-driven) `backup_cg` ที่ `lastCommitted == maxReceived` ทุก partition = ตามทันงานหมดแล้ว ไม่มีค้าง
+อยากขยายเพดาน = เพิ่ม partition ที่ Kafka (ไม่ใช่เพิ่ม pod)
 
-### 8.4 สิ่งที่ต้องปรับในโค้ดเพื่อรองรับหลาย partition
+**Scale in/out อยู่ตรงไหนในโค้ด** — ที่ rebalance callback:
 
-โค้ดปัจจุบันยังรองรับ partition เดียว จุดที่ต้องแก้:
+```
+Scale OUT (k8s เพิ่ม pod)          Scale IN (k8s ลด pod)
+   ↓                                  ↓
+consumer ใหม่ join group            consumer หาย/ถูกฆ่า
+   ↓                                  ↓
+Kafka rebalance                     Kafka rebalance
+   ↓                                  ↓
+assignPrntCB()                      revokePrtnCB()
+→ pod เดิมคืน partition บางส่วน       → commit ค้างก่อนปล่อย ✅
+→ pod ใหม่รับ partition ไป           → แจก partition ให้ตัวที่เหลือ
+```
 
-1. **`tp := kafka.TopicPartition{..., Partition: 0}`** — hardcode partition 0 อยู่ ต้องเปลี่ยนให้ทำงานกับทุก partition ที่ถูก assign (ดูจาก `Assignment()`)
-2. **`msgsStateMap map[kafka.Offset]bool`** — เป็น map รวมตัวเดียว ปัญหาคือ offset 3 ของ P0 จะชนกับ offset 3 ของ P1 ต้องเปลี่ยนเป็น **per-partition state** เช่น `map[int32]map[kafka.Offset]bool` (partition → offset → done) หรือสร้าง struct `PartitionState` แยกต่อ partition
-3. **`lastCommited` / `maxReceived`** — ต้องแยกต่อ partition เช่นกัน (แต่ละ partition มีตำแหน่ง commit ของตัวเอง)
-4. **`commitOffsetLoop`** — ต้อง scan + commit แยกต่อ partition (วนทุก partition ที่ถือ แล้ว commit รายตัว)
-5. **rebalance handler** — เมื่อ partition ถูกแจกใหม่ (pod เพิ่ม/หาย) ต้องจัดการ state ของ partition ที่ได้รับ/เสียไป
+`revokePrtnCB` ที่ commit ก่อนปล่อย คือพระเอกตอน scale in — กัน pod ที่รับช่วงอ่านซ้ำเยอะ
 
-นี่คือทิศทางการโตของโปรเจกต์ — โครงสร้าง `PartitionState` ต่อ partition คือหัวใจที่ทำให้ scale ได้ตามภาพ §8.2
+**ภาพรวม k8s ↔ Kafka:**
+
+```
+API traffic เยอะขึ้น
+   ↓ k8s HPA เพิ่ม consumer replicas (2 → 4 pod)     ← "API Scales"
+   ↓ 4 pod join group "local_cg1"
+   ↓ Kafka แจก 4 partition ให้ 4 pod → rebalance assign
+   ↓ throughput รวมเพิ่ม (แต่ละ pod รับ 1 partition)
+```
+
+สรุป: **producer + consumer scale ตาม k8s replicas ✅ แต่ partition เป็นเพดานฝั่ง Kafka ไม่ scale ตาม pod** — scale out/in ที่เห็นผลจริงคือฝั่ง consumer ซึ่ง trigger rebalance
+
+### 8.4 ทดสอบ rebalance
+
+เปิด `go run ./cmd` หลาย terminal พร้อมกัน (group เดียวกัน) → Kafka จะแจก 4 partition ให้แต่ละ instance → ดู log `✅ Assigned partition` / `❌ Revoking partition` ถ้าปิดตัวนึง partition จะถูกแจกใหม่ให้ตัวที่เหลือ (rebalance)

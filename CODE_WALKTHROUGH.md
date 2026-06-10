@@ -1,45 +1,46 @@
 # golang_kafka — Code Walkthrough (ไล่ทุกบรรทัด)
 
-เอกสารนี้อธิบายโค้ด **ทุกบรรทัด** — ทุก struct, func, method, pointer, variable — เรียงตาม **ลำดับการสร้างจริง** (build order) เพื่อให้ทั้งเข้าใจโค้ดและสร้างขึ้นใหม่ได้ทีละ step
+อธิบายโค้ด **ทุกบรรทัด** — struct, func, method, pointer, variable — เรียงตาม **ลำดับการสร้างจริง** (build order)
 
-> วิธีอ่าน: ไล่จากบนลงล่างได้เลย แต่ละไฟล์เรียงตาม dependency — ไฟล์ที่ไม่พึ่งใครมาก่อน ไฟล์ที่ประกอบทุกอย่าง (`main.go`) มาท้ายสุด ถ้าสร้างใหม่ก็พิมพ์ตามลำดับนี้
+> เวอร์ชันนี้ตรงกับโค้ดปัจจุบัน (มี rebalance + per-partition state + enum) อ่านคู่กับ `REBALANCE.md` สำหรับ rebalance เชิงลึก
 
 ---
 
 ## Go primer — syntax ที่ใช้ในโปรเจกต์นี้
 
-ปูพื้น 10 อย่างที่เจอซ้ำๆ ก่อน จะได้ไม่ต้องอธิบายซ้ำทุกจุด
-
 | syntax | หมายถึง |
 |---|---|
-| `type X struct {…}` | นิยาม struct (โครงสร้างข้อมูล รวมหลาย field) |
-| `func (x *X) M()` | **method** ของ type X — `(x *X)` คือ receiver (เหมือน `this`) |
-| `*X` (pointer) | ตัวชี้ไปยังที่อยู่ของ X — แก้ค่าจริงได้ + ไม่ copy ทั้งก้อน |
-| `&x` | เอา "ที่อยู่" ของ x (สร้าง pointer ชี้ไป x) |
-| `a, err := f()` | รับค่าหลายตัว (Go คืนได้หลายค่า) + `:=` ประกาศ+assign ในที |
-| `if err != nil {…}` | สำนวนเช็ค error มาตรฐาน (Go ไม่มี try/catch) |
-| `chan T` | channel — ท่อส่งข้อมูล T ข้าม goroutine |
-| `go f()` | สั่งรัน f() เป็น goroutine (ขนาน ไม่รอ) |
-| `defer f()` | เลื่อน f() ไปทำตอนฟังก์ชันปัจจุบันจบ |
-| `_ "pkg"` | blank import — โหลด pkg เพื่อ side-effect (`init()`) โดยไม่เรียกตรงๆ |
-| `func F[T any](…)` | generic — T เป็น type parameter (ใส่ type อะไรก็ได้) |
+| `type X struct {…}` | นิยาม struct |
+| `func (x *X) M()` | method ของ X — `(x *X)` คือ receiver (เหมือน `this`) |
+| `*X` (pointer) / `&x` | ตัวชี้ไปที่อยู่ / เอาที่อยู่ของ x |
+| `a, err := f()` | รับหลายค่า + `:=` ประกาศ+assign |
+| `if err != nil {…}` | เช็ค error มาตรฐาน (ไม่มี try/catch) |
+| `chan T` / `chan<- T` | channel / channel ส่งออกอย่างเดียว |
+| `go f()` | รัน f() เป็น goroutine (ขนาน) |
+| `defer f()` | เลื่อน f() ไปทำตอนฟังก์ชันจบ |
+| `_ "pkg"` | blank import (โหลดเพื่อ `init()`) |
+| `func F[T any](…)` | generic — T เป็น type parameter |
+| `const ( A = iota; B; C )` | enum อัตโนมัติ (A=0, B=1, C=2) |
+| `atomic.Int32` | ตัวเลขที่อ่าน/เขียนข้าม goroutine ได้ปลอดภัยโดยไม่ต้อง lock |
+| `context.WithCancel` | สร้าง context ที่สั่งยกเลิกได้ (ใช้หยุด goroutine) |
+| `switch v := e.(type)` | type switch — เช็คชนิดจริงของ interface |
 
 ---
 
-## Build order (ภาพรวม 8 step)
+## Build order (9 step)
 
 ```
-Step 1  go mod init                         ← ตั้ง module
-Step 2  internal/shared/kafka-config.go     ← config (ไม่พึ่งใคร)
-Step 3  internal/repo/db.go                 ← เชื่อม DB + util
-Step 4  internal/repo/event-repo.go         ← Event + CRUD + TxClosure
-Step 5  internal/shared/types.go            ← Message (พึ่ง repo.Event)
-Step 6  internal/producer/producer.go       ← producer (พึ่ง shared)
-Step 7  internal/consumer/consumer.go       ← consumer (พึ่ง shared)
-Step 8  cmd/main.go                          ← ประกอบทุกอย่าง
+Step 1  go mod init
+Step 2  internal/shared/kafka-config.go      ← config (ไม่พึ่งใคร)
+Step 3  internal/repo/db.go                  ← เชื่อม DB + util
+Step 4  internal/repo/event-repo.go          ← Event + CRUD + TxClosure
+Step 5  internal/repo/repo-err.go            ← ตรวจ duplicate key  ★ใหม่
+Step 6  internal/shared/types.go             ← Message (พึ่ง repo.Event)
+Step 7  internal/producer/producer.go        ← producer
+Step 8  internal/consumer/parition-state.go  ← PartitionState + commit loop  ★ใหม่
+Step 9  internal/consumer/consumer.go        ← consumer + rebalance
+Step 10 cmd/main.go                          ← ประกอบทุกอย่าง
 ```
-
-เหตุผลของลำดับ: ไฟล์ล่างพึ่งไฟล์บน เลยต้องมีของบนก่อน ถ้าพิมพ์สลับจะ compile ไม่ผ่านเพราะอ้างของที่ยังไม่มี
 
 ---
 
@@ -48,115 +49,79 @@ Step 8  cmd/main.go                          ← ประกอบทุกอ�
 ```bash
 go mod init github.com/golang_kafka
 ```
-
-สร้างไฟล์ `go.mod` ที่ประกาศชื่อ module = `github.com/golang_kafka` ชื่อนี้คือ prefix ของทุก import ในโปรเจกต์ (เช่น `github.com/golang_kafka/internal/repo`) ทุก `go get` หลังจากนี้จะถูกบันทึกใน go.mod
+ตั้งชื่อ module = prefix ของทุก import
 
 ---
 
 ## Step 2 — `internal/shared/kafka-config.go`
 
-ไฟล์เล็กสุด ไม่พึ่งใคร เลยสร้างก่อน
-
 ```go
-package shared
+type KafkaPartitionStrategies string
+const (
+    CooperativeStickyStrategy KafkaPartitionStrategies = "cooperative-sticky"
+    RoundRobin                KafkaPartitionStrategies = "roundrobin"
+)
 ```
-ประกาศว่าไฟล์นี้อยู่ใน package `shared`
+- นิยาม type ใหม่จาก string + 2 ค่าคงที่ของกลยุทธ์แจก partition (ใช้ตอน rebalance)
 
 ```go
 type KafkaConfig struct {
-    Topic         string   // ชื่อ topic ที่จะใช้ ("local_topic")
-    ConsumerGroup string   // group.id ของ consumer ("local_cg")
-    Host          string   // ที่อยู่ Kafka broker ("localhost")
+    DefaultTopic             string                    // "local_topic_sticky1"
+    Host                     string                    // "localhost"
+    ConsumerGroup            string                    // "local_cg1"
+    ParititionAssignStrategy KafkaPartitionStrategies  // cooperative-sticky
+    NumPartitions            int                       // 4
 }
-```
-- `type KafkaConfig struct` — นิยาม struct เก็บ config 3 ตัว
-- ทั้ง 3 field เป็น `string`
 
-```go
 func NewKafkaConfig() *KafkaConfig {
     return &KafkaConfig{
-        Topic:         "local_topic",
-        ConsumerGroup: "local_cg",
-        Host:          "localhost",
+        ParititionAssignStrategy: CooperativeStickyStrategy,
+        DefaultTopic:             "local_topic_sticky1",
+        Host:                     "localhost",
+        ConsumerGroup:            "local_cg1",
+        NumPartitions:            4,
     }
 }
 ```
-- `func NewKafkaConfig() *KafkaConfig` — constructor คืน **pointer** ไปยัง KafkaConfig (`*KafkaConfig`)
-- `return &KafkaConfig{…}` — `&` สร้าง instance แล้วคืน pointer ของมัน
-- ทำไมคืน pointer: ไม่ต้อง copy struct + ฝั่งเรียกใช้อ้าง field เดียวกันได้ (ที่นี่จริงๆ struct เล็ก จะ value ก็ได้ แต่ pointer เป็นสำนวนนิยมของ constructor)
-
-> นี่คือ pattern "constructor function" ของ Go — Go ไม่มี keyword `new`/class แบบภาษาอื่น เลยใช้ฟังก์ชัน `NewXxx()` คืน instance แทน
+- config กลาง — เพิ่ม `NumPartitions: 4` (เปิดให้ขนานระดับ partition) + `strategy` (วิธี rebalance)
+- คืน `*KafkaConfig` (pointer)
 
 ---
 
 ## Step 3 — `internal/repo/db.go`
 
-เชื่อม PostgreSQL + ฟังก์ชัน util
-
 ```go
-package repo
-
 import (
-    "math/rand"
-    "time"
-
+    "math/rand"; "time"
     "github.com/jmoiron/sqlx"
     _ "github.com/lib/pq"   // blank import: register driver "postgres"
 )
 ```
-- `sqlx` — library ครอบ `database/sql` ให้ใช้ง่ายขึ้น (map struct ↔ row ได้)
-- `_ "github.com/lib/pq"` — **blank import** ตัว driver PostgreSQL. เครื่องหมาย `_` แปลว่า "โหลด package นี้แต่ไม่เรียกใช้ตรงๆ" — โหลดเพื่อให้ `init()` ของ pq ทำงาน ซึ่งจะ **register driver ชื่อ "postgres"** เข้า `database/sql` ถ้าไม่มีบรรทัดนี้ → `sqlx.Connect("postgres", …)` จะ panic `unknown driver`
+- `_ "github.com/lib/pq"` — โหลด driver เพื่อให้ `init()` register ชื่อ "postgres" ไม่งั้น `Connect` panic
 
 ```go
 func getDBConnString() string {
-    return "host=localhost port=5433 user=alphamech password=alphamech1234@ dbname=kafka_yt sslmode=disable"
+    return "host=localhost port=5433 user=alphamech password=... dbname=kafka_yt sslmode=disable"
 }
-```
-- ฟังก์ชันเล็ก คืน connection string (DSN) ของ PostgreSQL
-- ตัวพิมพ์เล็กขึ้นต้น (`getDBConnString`) = **private** เห็นแค่ใน package `repo` (Go ใช้ตัวพิมพ์ใหญ่/เล็กคุม export: ใหญ่=public, เล็ก=private)
-
-```go
 func NewDBConn() (*sqlx.DB, error) {
     db, err := sqlx.Connect("postgres", getDBConnString())
-    if err != nil {
-        return nil, err
-    }
+    if err != nil { return nil, err }
     return db, nil
 }
 ```
-- `func NewDBConn() (*sqlx.DB, error)` — คืน 2 ค่า: pointer ไป `sqlx.DB` + error
-- `sqlx.Connect("postgres", …)` — เปิด connection ด้วย driver ชื่อ "postgres" (ที่ pq register ไว้) + ping ทดสอบเลย
-- `if err != nil { return nil, err }` — ถ้าต่อไม่ติด คืน nil + error ออกไป
-- `return db, nil` — สำเร็จ คืน db + nil (ไม่มี error)
+- `NewDBConn` เปิด connection + ping ทดสอบ คืน `(*sqlx.DB, error)`
+- ⚠️ password hardcode — ควรย้ายไป env (ดู ARCHITECTURE §7)
 
 ```go
-var seededRand *rand.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
-var charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+var seededRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+var charset = "abc...XYZ0123456789"
+func GenerateRandomString(length int) string { /* สุ่มตัวอักษรจาก charset */ }
 ```
-- `var seededRand *rand.Rand` — ตัวแปร package-level (อยู่นอกฟังก์ชัน ใช้ได้ทั้งไฟล์) ชนิด pointer ไป `rand.Rand`
-- `rand.New(rand.NewSource(time.Now().UnixNano()))` — สร้าง random generator ที่ seed ด้วยเวลาปัจจุบัน (ns) เพื่อให้สุ่มไม่ซ้ำทุกครั้งที่รัน
-- `charset` — ชุดตัวอักษรที่ใช้สุ่ม
-
-```go
-func GenerateRandomString(length int) string {
-    b := make([]byte, length)
-    for i := range b {
-        b[i] = charset[seededRand.Intn(len(charset))]
-    }
-    return string(b)
-}
-```
-- `func GenerateRandomString(length int) string` — สร้าง string สุ่มยาว `length` (public เพราะขึ้นต้นตัวใหญ่)
-- `b := make([]byte, length)` — สร้าง slice ของ byte ขนาด length (`make` ใช้สร้าง slice/map/channel)
-- `for i := range b` — วน index ของ b
-- `charset[seededRand.Intn(len(charset))]` — สุ่ม index ใน charset (`Intn(n)` = สุ่ม 0..n-1) แล้วหยิบตัวอักษรนั้น
-- `return string(b)` — แปลง []byte กลับเป็น string
+- util สร้าง string สุ่ม (ใช้ทำ event id + consumer id)
 
 ---
 
 ## Step 4 — `internal/repo/event-repo.go`
-
-นิยาม Event + การอ่าน/เขียน DB + helper ครอบ transaction
 
 ```go
 type Event struct {
@@ -165,433 +130,319 @@ type Event struct {
     Timespamp time.Time `db:"timestamp"`
 }
 ```
-- struct ที่แทน 1 แถวในตาราง `events`
-- `` `db:"event_id"` `` คือ **struct tag** — บอก sqlx ว่า field `EventId` ตรงกับ column `event_id` ในตาราง (ใช้ตอน map row ↔ struct)
-- หมายเหตุ: `Timespamp` สะกดผิด (ควร Timestamp) แต่ db tag ถูก เลยทำงานได้
+- 1 แถวในตาราง `events`, `` `db:"..."` `` = struct tag บอก sqlx ว่า field ตรงกับ column ไหน
 
 ```go
-func NewEvent() *Event {
-    id := GenerateRandomString(15)
-    return &Event{
-        EventId:   id,
-        EventName: "test_event",
-        Timespamp: time.Now(),
-    }
-}
+func NewEvent() *Event { /* id สุ่ม 15 ตัว, name="test_event", time=now */ }
+
+type EventRepo struct { repo *sqlx.DB; tableName string }
+func NewEventRepo(db *sqlx.DB) *EventRepo { … }   // ฉีด DB เข้ามา (DI)
+
+func (r *EventRepo) Insert(ctx, tx *sqlx.Tx, e *Event) (string, error) { … }  // INSERT ผ่าน tx
+func (r *EventRepo) Get(ctx, tx *sqlx.Tx, eventID string) *Event { … }        // SELECT, ไม่เจอคืน nil
 ```
-- constructor สร้าง Event ใหม่: id สุ่ม 15 ตัว, ชื่อคงที่ "test_event", เวลาปัจจุบัน
-- คืน `*Event` (pointer)
+- ทุก method รับ `tx *sqlx.Tx` (transaction) → หลาย operation อยู่ใน tx เดียวได้
+- `Get` คืน nil เมื่อ `sql.ErrNoRows` → ใช้เช็ค idempotent
 
 ```go
-type EventRepo struct {
-    repo      *sqlx.DB   // connection pool
-    tableName string     // "events"
-}
-
-func NewEventRepo(db *sqlx.DB) *EventRepo {
-    return &EventRepo{repo: db, tableName: "events"}
-}
-```
-- `EventRepo` ห่อ DB connection + ชื่อตาราง — เป็น "repository" รวมงาน DB ของ Event ไว้ที่เดียว
-- constructor รับ `*sqlx.DB` (ฉีดเข้ามา = dependency injection) แล้วเก็บไว้
-
-```go
-func (r *EventRepo) Insert(ctx context.Context, tx *sqlx.Tx, e *Event) (string, error) {
-    _, err := tx.NamedExecContext(ctx,
-        fmt.Sprintf("INSERT INTO %s (event_type, event_id, timestamp) VALUES(:event_type, :event_id, :timestamp)", r.tableName), e)
-    if err != nil {
-        fmt.Printf("err on insert = %v\n", err)
-        return "", err
-    }
-    return e.EventId, nil
-}
-```
-- `func (r *EventRepo) Insert(...)` — **method** ของ EventRepo (receiver `r`)
-- `ctx context.Context` — ส่ง context เข้าไป (ใช้ยกเลิก/timeout ได้)
-- `tx *sqlx.Tx` — รับ **transaction** เข้ามา (ไม่ใช้ connection ตรงๆ → ทำให้หลาย operation อยู่ใน tx เดียวได้)
-- `e *Event` — ข้อมูลที่จะ insert
-- `tx.NamedExecContext` — รัน SQL แบบ named parameter (`:event_id` map กับ field ผ่าน db tag)
-- `_, err :=` — ไม่สนค่าแรก (Result) เอาแค่ err
-- คืน `(string, error)` — event id ที่ insert + error
-
-```go
-func (r *EventRepo) Get(ctx context.Context, tx *sqlx.Tx, eventID string) *Event {
-    e := &Event{}
-    q := fmt.Sprintf("SELECT event_id from %s WHERE event_id = $1", r.tableName)
-    err := tx.GetContext(ctx, e, q, eventID)
-    if err != nil {
-        if err == sql.ErrNoRows {
-            return nil
-        }
-    }
-    return e
-}
-```
-- ค้น event ตาม id — `$1` คือ placeholder ของ PostgreSQL (กัน SQL injection)
-- `tx.GetContext(ctx, e, q, eventID)` — query แล้ว map ผลลง `e`
-- `if err == sql.ErrNoRows { return nil }` — ถ้าไม่เจอแถว คืน nil (= ยังไม่มี event นี้) ← จุดนี้คือหัวใจของ idempotent
-- คืน `*Event` (nil ถ้าไม่เจอ)
-
-```go
-func TxClosure[T any](ctx context.Context, r *EventRepo, fn func(ctx context.Context, tx *sqlx.Tx) (T, error)) (T, error) {
-```
-- `func TxClosure[T any](...)` — **generic function** — `[T any]` บอกว่า T เป็น type อะไรก็ได้ (return type ยืดหยุ่น)
-- `fn func(ctx, tx) (T, error)` — รับ **ฟังก์ชัน(closure)** เข้ามาเป็น argument — นี่คือ "งานที่อยากทำใน transaction"
-- ไอเดีย: คนเรียกแค่เขียน logic ส่งเข้ามา ส่วน begin/commit/rollback ให้ helper จัดการ
-
-```go
-    tx, err := r.repo.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-    if err != nil {
-        panic("unable to start TX")
-    }
-```
-- `BeginTxx` — เปิด transaction ใหม่, `Isolation: ReadCommitted` = ระดับการแยกของ tx (อ่านเห็นแต่ข้อมูลที่ commit แล้ว)
-- เปิดไม่ได้ก็ panic
-
-```go
+func TxClosure[T any](ctx, r *EventRepo, fn func(ctx, tx) (T, error)) (T, error) {
+    tx, _ := r.repo.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
     defer func() {
-        if r := recover(); r != nil {   // ถ้ามี panic
-            tx.Rollback()
-            panic(r)                     // rollback แล้วโยน panic ต่อ
-        }
-        if err != nil {                  // ถ้ามี error
-            tx.Rollback()
-            return
-        }
-        err = tx.Commit()                // ไม่มีปัญหา → commit
-        if err != nil {
-            fmt.Printf("err on commit = %v\n", err)
-        }
+        if r := recover(); r != nil { tx.Rollback(); panic(r) }  // panic → rollback
+        if err != nil { tx.Rollback(); return }                  // error → rollback
+        err = tx.Commit()                                         // สำเร็จ → commit
     }()
-```
-- `defer func(){…}()` — ฟังก์ชันนี้จะทำงาน **ตอน TxClosure จบ** (ไม่ว่าจบปกติหรือ panic)
-- `recover()` — ดักจับ panic (ถ้ามี) → rollback แล้วโยนต่อ
-- ถ้า `err != nil` → rollback
-- ไม่งั้น → `tx.Commit()`
-- รูปแบบนี้ทำให้ทุก exit path จัดการ tx ถูกต้องอัตโนมัติ
-
-```go
     res, err := fn(ctx, tx)
-    if err != nil {
-        return res, err
-    }
     return res, err
 }
 ```
-- เรียก closure ที่รับเข้ามา ส่ง tx ให้ → ได้ผล + error
-- ค่า `err` ตรงนี้คือตัวเดียวกับที่ `defer` ด้านบนเช็ค (closure variable) → ตัดสินว่า commit หรือ rollback
+- generic helper ครอบ transaction — ส่ง closure (logic) เข้าไป ส่วน begin/commit/rollback จัดการให้
 
 ---
 
-## Step 5 — `internal/shared/types.go`
+## Step 5 — `internal/repo/repo-err.go` ★
 
-นิยามรูปแบบ message ที่ส่งผ่าน channel (พึ่ง `repo.Event` เลยต้องมาหลัง repo)
+```go
+var (
+    ErrDuplicateCode = "23505"               // PostgreSQL: unique_violation
+    ErrDuplicateMsg  = "duplicate key violation"
+)
+
+func IsDuplicateKeyErr(err error) bool {
+    var pgErr *pq.Error
+    if err != nil {
+        if errors.As(err, &pgErr) {           // แปลง error เป็น *pq.Error
+            return pgErr.Code == pq.ErrorCode(ErrDuplicateCode)
+        }
+    }
+    return false
+}
+```
+- ตรวจว่า error จาก insert เป็น "duplicate key" (PG code `23505`) ไหม
+- `errors.As(err, &pgErr)` — เช็คว่า error chain มี `*pq.Error` ไหม ถ้ามีก็ดึงออกมา
+- ใช้ทำ idempotent แบบพึ่ง DB constraint (insert ตรงๆ ถ้าซ้ำจับ error นี้) — ทางเลือกแทนการ `Get` ก่อน
+
+---
+
+## Step 6 — `internal/shared/types.go`
 
 ```go
 type Message struct {
     Metadata *kafka.TopicPartition  // topic/partition/offset
-    Event    *repo.Event            // เนื้อหา event ที่ unmarshal แล้ว
+    Event    *repo.Event            // เนื้อหา
 }
-```
-- มัด 2 อย่าง: **Metadata** (รู้ว่า message มาจาก offset ไหน — ใช้ตอน commit) + **Event** (ข้อมูลจริงไป process)
-- ทั้งคู่เป็น pointer
-
-```go
 func NewMessage(metadata *kafka.TopicPartition, data []byte) *Message {
     e := &repo.Event{}
-    err := json.Unmarshal(data, e)
-    if err != nil {
-        panic(fmt.Sprintf("err unmarshalling event = %v\n", err))
+    if err := json.Unmarshal(data, e); err != nil {
+        panic(...)
     }
     return &Message{Metadata: metadata, Event: e}
 }
 ```
-- รับ metadata + `data []byte` (ตัว value ดิบจาก Kafka)
-- `json.Unmarshal(data, e)` — แปลง JSON bytes → struct Event (เก็บลง `e`)
-- พังก็ panic — นี่คือจุดที่เคย error ตอน producer ส่ง plain text (ไม่ใช่ JSON)
-- คืน `*Message` พร้อมใช้
+- มัด metadata (ใช้ตอน commit + UpdateState — ต้องรู้ partition+offset) + event ที่ unmarshal แล้ว
+- `Metadata` สำคัญขึ้นเพราะตอนนี้ส่งเข้า `UpdateState(tp, state)` เพื่อระบุว่า offset ไหนของ partition ไหน
 
 ---
 
-## Step 6 — `internal/producer/producer.go`
+## Step 7 — `internal/producer/producer.go`
 
 ```go
-type KafkaProducer struct {
-    producer *kafka.Producer  // ตัว producer จริงของ library
-    topic    string           // topic ที่จะยิงเข้า
-}
-```
-- ห่อ `*kafka.Producer` + จำ topic
+type KafkaProducer struct { producer *kafka.Producer; topic string }
 
-```go
-func NewKafkaProducer(topic string) *KafkaProducer {
+func NewKafkaProducer() *KafkaProducer {        // ไม่รับ arg แล้ว
     cfg := shared.NewKafkaConfig()
-    if topic == "" {
-        topic = cfg.Topic
-    }
-```
-- ดึง config, ถ้าไม่ส่ง topic มา (`""`) ใช้ default จาก config
+    topic := cfg.DefaultTopic
+    p, _ := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": cfg.Host})
 
-```go
-    p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": cfg.Host})
-    if err != nil {
-        panic(err)
-    }
-    // ❌ ห้าม defer p.Close() ตรงนี้ — constructor return ปุ๊บ producer ปิดทันที
-```
-- สร้าง producer ชี้ไป broker, พังก็ panic
-- คอมเมนต์เตือน bug ที่เคยเจอ: `defer p.Close()` ใน constructor = ปิดทันทีที่ฟังก์ชันจบ → ใช้ไม่ได้
-
-```go
-    go func() {
+    go func() {                                  // delivery report listener
         for e := range p.Events() {
             switch ev := e.(type) {
             case *kafka.Message:
-                if ev.TopicPartition.Error != nil {
-                    fmt.Printf("Delivery failed: %v\n", ev.TopicPartition)
-                } else {
-                    fmt.Printf("Delivered message to %v\n", ev.TopicPartition)
-                }
+                if ev.TopicPartition.Error != nil { /* log fail */ }
+                else { logrus...Info("Delivered message") }  // log partition+offset
             }
         }
     }()
-```
-- `go func(){…}()` — เปิด goroutine ฟัง **delivery report**
-- `for e := range p.Events()` — วนรับ event จาก channel ของ producer
-- `switch ev := e.(type)` — **type switch** เช็คว่า event เป็นชนิดไหน
-- `case *kafka.Message:` — ถ้าเป็นรายงานผลส่ง message → log สำเร็จ/ล้มเหลว
-- ทำไมต้องมี: `Produce()` เป็น **async** (return ทันที) ผลส่งจริงมาทีหลังทาง channel นี้
-
-```go
     return &KafkaProducer{producer: p, topic: topic}
 }
-```
-- คืน instance พร้อมใช้
 
-```go
-func (p *KafkaProducer) Producer(msg string) {
-    err := p.producer.Produce(&kafka.Message{
-        TopicPartition: kafka.TopicPartition{Topic: &p.topic, Partition: kafka.PartitionAny},
-        Value:          []byte(msg),
+func (p *KafkaProducer) Produce(msg []byte) {    // ชื่อ Produce, รับ []byte
+    cfg := shared.NewKafkaConfig()
+    topic := cfg.DefaultTopic
+    p.producer.Produce(&kafka.Message{
+        TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+        Value:          msg,
     }, nil)
-    if err != nil {
-        fmt.Printf("error producing msg := %v\n", err)
-    }
 }
 ```
-- method ยิง message จริง
-- `TopicPartition{Topic: &p.topic, Partition: kafka.PartitionAny}` — ส่งเข้า topic นี้, `PartitionAny` = ให้ Kafka เลือก partition เอง
-- `Value: []byte(msg)` — payload (แปลง string → bytes)
-- arg ที่ 2 เป็น `nil` = ไม่ส่ง delivery channel เฉพาะ (ใช้ channel กลางที่ goroutine ข้างบนฟังอยู่)
-
-```go
-func (p *KafkaProducer) Close() {
-    p.producer.Flush(5000)   // รอ message ค้างใน queue ส่งให้หมด (สูงสุด 5 วิ)
-    p.producer.Close()       // ปิด producer
-}
-```
-- ไว้เรียกตอน shutdown — `Flush` กันข้อมูลค้างหาย
+- `NewKafkaProducer()` ไม่รับ arg (ดึง topic จาก config), เปิด goroutine ฟัง delivery report
+- `Produce(msg []byte)` — `PartitionAny` ให้ Kafka กระจาย message ไปทั้ง 4 partition เอง
+- (เดิมชื่อ `Producer(string)` → เปลี่ยนเป็น `Produce([]byte)`)
 
 ---
 
-## Step 7 — `internal/consumer/consumer.go`
+## Step 8 — `internal/consumer/parition-state.go` ★
 
-ไฟล์ใหญ่สุด หัวใจของ sequential commit
+state + commit loop **แยกต่อ partition**
 
-### 7.1 struct
+```go
+type MsgState = int32
+const (
+    MsgState_Pending MsgState = iota   // 0
+    MsgState_Success                   // 1
+    MsgState_Error                     // 2
+)
+```
+- enum 3 สถานะ (เดิมเป็น `bool`) — แยก Error ออกจาก Success ได้
+
+```go
+type PartitionState struct {
+    ID    int32
+    Topic *string
+    mu    *sync.RWMutex
+    state map[kafka.Offset]MsgState    // offset → สถานะ ของ partition นี้
+
+    maxReceived  *atomic.Int32         // offset สูงสุดที่อ่านมา
+    lastCommited *atomic.Int32         // commit ถึงไหนแล้ว
+
+    ctx    context.Context             // ใช้สั่งหยุด commit loop
+    cancel context.CancelFunc
+    exitCH chan struct{}               // ยืนยันว่า loop หยุดจริง
+}
+```
+- **1 instance ต่อ 1 partition** — เพราะ offset แต่ละ partition นับแยก ใช้ map รวมจะชนกัน
+- `atomic.Int32` — `maxReceived`/`lastCommited` อ่าน/เขียนข้าม goroutine ปลอดภัยโดยไม่ต้อง lock
+- `ctx/cancel/exitCH` — กลไกหยุด loop ตอน partition ถูก revoke
+
+```go
+func NewPartitionState(tp *kafka.TopicPartition) *PartitionState {
+    ctx, cancel := context.WithCancel(context.Background())
+    initialLastCommited := tp.Offset - 1                      // committed = ตัวถัดไป → ล่าสุด = offset-1
+    if tp.Offset == kafka.OffsetBeginning || tp.Offset < 0 {
+        initialLastCommited = -1                              // ยังไม่เคย commit
+    }
+    ...store ใน atomic...
+}
+```
+- เริ่ม `lastCommited = offset - 1` — **นี่ตอบเรื่อง offset-1 ที่เคยสงสัย** มันตั้งใจ (committed offset = "ตัวถัดไปที่จะอ่าน")
+
+```go
+func (ps *PartitionState) commitOffsetLoop(commitDur time.Duration, c *KafkaConsumer) {
+    ticker := time.NewTicker(commitDur)
+    defer func() { close(ps.exitCH); ticker.Stop() }()       // ตอนจบ: ปิด exitCH ยืนยันหยุด
+    for {
+        select {
+        case <-ticker.C:                                      // ครบ 10 วิ
+            select { case <-ps.ctx.Done(): return; default: } // เช็คถูกสั่งหยุดยัง
+            latestToCommit, err := ps.findLatestToCommit()
+            if err != nil { continue }
+            c.consumer.CommitOffsets([]kafka.TopicPartition{{Topic: ps.Topic, Partition: ps.ID, Offset: latestToCommit}})
+            ps.lastCommited.Store(int32(latestToCommit))
+        case <-ps.ctx.Done():                                 // ถูกสั่งหยุด (revoke)
+            return
+        }
+    }
+}
+```
+- commit loop **ของแต่ละ partition** (ไม่ใช่รวม) — ticker ทุก 10 วิ → หา offset ที่ commit ได้ → commit
+- `select { case <-ps.ctx.Done() }` — ออกจาก loop ทันทีเมื่อถูกสั่งหยุด (ตอน revoke)
+
+```go
+func (ps *PartitionState) findLatestToCommit() (kafka.Offset, error) {
+    lastCommited := kafka.Offset(ps.lastCommited.Load())
+    latestToCommit := kafka.Offset(ps.maxReceived.Load())
+    if lastCommited == latestToCommit { return -1, err }       // ไม่มีอะไรใหม่ → ข้าม
+
+    ps.mu.Lock(); defer ps.mu.Unlock()
+    for offset := lastCommited; offset <= latestToCommit; offset++ {
+        msgState, exists := ps.state[offset]
+        if !exists { continue }
+        if msgState != MsgState_Pending {                      // Success/Error → ผ่านได้
+            delete(ps.state, offset)
+            if len(ps.state) == 0 { latestToCommit = offset + 1; break }
+            continue
+        }
+        latestToCommit = offset                                // เจอ Pending → หยุด (กำแพง)
+        break
+    }
+    return latestToCommit, nil
+}
+```
+- หัวใจ **sequential commit** — scan จาก lastCommited เจอ Pending = หยุด ส่วน Success/Error ลบทิ้งแล้วผ่าน
+- ใช้ `Lock` แค่ตอน scan map (ไม่ค้าง lock ข้าม commit) — ต่างจากเวอร์ชันเก่าที่เสี่ยง deadlock
+
+---
+
+## Step 9 — `internal/consumer/consumer.go`
+
+### 9.1 struct
 
 ```go
 type KafkaConsumer struct {
-    Consumer     *kafka.Consumer        // consumer จริงของ library (public)
+    consumer     *kafka.Consumer
+    ID           string                    // id สุ่ม (ดูง่ายตอนรันหลาย instance)
     topic        string
-    msgCH        chan<- *shared.Message  // channel "ส่งออกอย่างเดียว" (send-only)
-    readyCH      chan struct{}           // สัญญาณว่าพร้อม
-    exitCH       chan struct{}           // สัญญาณให้หยุด
-    isReady      bool
-
-    msgsStateMap map[kafka.Offset]bool   // offset → process เสร็จยัง
-    lastCommited kafka.Offset            // commit ถึง offset ไหนแล้ว
-    maxReceived  *kafka.TopicPartition   // offset สูงสุดที่อ่านมา
-    mu           *sync.RWMutex           // ล็อกกัน race ตอนแตะ stateMap
-    commitDur    time.Duration           // คาบเวลา commit (15 วิ)
+    IsReady      bool
+    ReadyCH      chan struct{}
+    MsgCH        chan *shared.Message      // ส่ง message ออกให้ handler
+    exitCH       chan struct{}
+    mu           *sync.RWMutex
+    msgsStateMap map[int32]*PartitionState // partition → state (แยกต่อ partition!)
+    commitDur    time.Duration             // 10s
+    cfg          *shared.KafkaConfig
 }
 ```
-- `chan<- *shared.Message` — เครื่องหมาย `<-` หลัง `chan` = channel ส่งออกอย่างเดียว (consumer ส่งเข้า ไม่อ่านออก)
-- `chan struct{}` — channel ที่ไม่ส่งข้อมูลจริง ใช้แค่เป็น "สัญญาณ" (`struct{}` กินหน่วยความจำ 0)
-- `map[kafka.Offset]bool` — map จาก offset → สถานะเสร็จ
-- `*sync.RWMutex` — mutex แบบอ่าน/เขียน ป้องกัน map จากหลาย goroutine
+- `msgsStateMap map[int32]*PartitionState` — เปลี่ยนจาก `map[Offset]bool` เป็น **map[partition]→PartitionState** (เก็บ state แยกต่อ partition)
 
-### 7.2 constructor
+### 9.2 constructor
 
 ```go
-c, err := kafka.NewConsumer(&kafka.ConfigMap{
-    "bootstrap.servers":  cfg.Host,
-    "group.id":           cfg.ConsumerGroup,
-    "enable.auto.commit": false,        // ← ปิด auto-commit คุมเอง
+c, _ := kafka.NewConsumer(&kafka.ConfigMap{
+    "enable.auto.commit":              false,
+    "auto.offset.reset":               "earliest",
+    "go.application.rebalance.enable": true,                          // จัดการ rebalance เอง
+    "partition.assignment.strategy":   string(cfg.ParititionAssignStrategy),  // cooperative-sticky
 })
+...
+c.SubscribeTopics([]string{consumer.topic}, consumer.rebalanceCB)    // ผูก rebalance callback
+return consumer
 ```
-- สร้าง consumer, จุดสำคัญ `enable.auto.commit: false` — ไม่ให้ library commit เอง
+- เพิ่ม config `go.application.rebalance.enable` + strategy
+- subscribe พร้อม **rebalance callback** (arg ที่ 2) — ไม่มี regex topic แล้ว
+- คืน `*KafkaConsumer` ตัวเดียว (เดิมคืน error ด้วย — เปลี่ยนแล้ว)
+
+### 9.3 RunConsumer — ตัวเริ่ม (ต้องเรียกจาก main)
 
 ```go
-tp := kafka.TopicPartition{Topic: &cfg.Topic, Partition: 0}
-commited, err := c.Committed([]kafka.TopicPartition{tp}, int(time.Second)*5)
-latestComm := commited[len(commited)-1].Offset
-logrus.WithField("OFFSET", latestComm).Info("starting POSITION")
-```
-- `tp` — ระบุ topic + partition 0
-- `c.Committed(...)` — ถาม Kafka ว่า group นี้เคย commit ถึง offset ไหน (timeout 5 วิ)
-- `commited[len(commited)-1].Offset` — เอา offset ตัวสุดท้าย = จุดเริ่มอ่านต่อ
-- log บอกตำแหน่งเริ่ม
-
-```go
-maxReceived := &kafka.TopicPartition{Topic: tp.Topic, Partition: tp.Partition, Offset: latestComm}
-
-consumer := &KafkaConsumer{
-    Consumer: c, msgCH: msgCH,
-    readyCH: make(chan struct{}), exitCH: make(chan struct{}),
-    isReady: false, topic: cfg.ConsumerGroup,
-    mu: new(sync.RWMutex), msgsStateMap: map[kafka.Offset]bool{},
-    lastCommited: latestComm, maxReceived: maxReceived,
-    commitDur: 15 * time.Second,
+func (c *KafkaConsumer) RunConsumer() struct{} {
+    go c.checkReadyToAccept()
+    go c.consumeLoop()
+    return <-c.exitCH        // block จนกว่า consumeLoop จะปิด exitCH
 }
 ```
-- เริ่มต้น `maxReceived` และ `lastCommited` ที่ offset เดิมที่เคย commit
-- `make(chan struct{})` — สร้าง channel, `new(sync.RWMutex)` — สร้าง mutex, `map[...]{}` — สร้าง map ว่าง
-- `commitDur: 15 * time.Second` — commit ทุก 15 วิ
+- เดิม constructor เปิด goroutine ให้ ตอนนี้ย้ายมา `RunConsumer` → **main ต้องเรียก `go s.consumer.RunConsumer()`**
+
+### 9.4 consumeLoop — อ่าน message
 
 ```go
-consumer.initializeKafkaTopic(cfg.Host, cfg.Topic)
-err = c.SubscribeTopics([]string{cfg.Topic, "^aRegex.*[Tt]opic"}, nil)
+for {
+    msg, err := c.consumer.ReadMessage(time.Second)
+    if err != nil && err.(kafka.Error).IsTimeout() { continue }     // timeout = ปกติ
+    if err != nil && !err.(kafka.Error).IsTimeout() { /* log */ continue }
+    if msg == nil { continue }
 
-go consumer.commitOffsetLoop()
-go consumer.checkReadyToAccept()
-go consumer.readMsgLoop()
-return consumer, nil
-```
-- สร้าง topic ถ้ายังไม่มี → subscribe → เปิด **3 goroutine** (commit loop / ready check / read loop) → คืน consumer
-- `"^aRegex.*[Tt]opic"` — regex topic ที่ไม่มีจริง (ทำให้ log รก — ลบได้)
+    if firstMsg { close(c.ReadyCH) }                                // message แรก = พร้อม
+    firstMsg = false
 
-### 7.3 readMsgLoop — อ่าน message
-
-```go
-func (c *KafkaConsumer) readMsgLoop() {
-    defer c.Consumer.Close()
-    for {
-        msg, err := c.Consumer.ReadMessage(time.Second)
-        if err != nil {
-            if kerr, ok := err.(kafka.Error); ok && kerr.IsTimeout() {
-                continue            // timeout = ปกติ ไม่มี message ช่วงนั้น
-            }
-            fmt.Printf("Consumer error: %v\n", err)
-            continue
-        }
-        c.appendMsgState(&msg.TopicPartition)              // จด offset = false
-        payload := shared.NewMessage(&msg.TopicPartition, msg.Value)  // unmarshal
-        c.msgCH <- payload                                  // ส่งเข้า channel
+    c.appendMsgState(&msg.TopicPartition)                           // จด Pending (per-partition)
+    msgRequest := shared.NewMessage(&msg.TopicPartition, msg.Value)
+    select {
+    case c.MsgCH <- msgRequest:                                     // ส่งเข้า channel
+    case <-time.After(5 * time.Second):                             // ถ้า channel เต็มเกิน 5 วิ
+        c.UpdateState(&msg.TopicPartition, MsgState_Error)          // → drop เป็น Error (กัน block)
     }
 }
 ```
-- `ReadMessage(time.Second)` — อ่าน message รอสูงสุด 1 วิ
-- `err.(kafka.Error)` — **type assertion** แปลง error เป็น `kafka.Error` เพื่อเช็ค `.IsTimeout()`
-- `ok` — บอกว่า assertion สำเร็จไหม (กัน panic ถ้า type ไม่ตรง)
-- timeout → `continue` วนใหม่ (นี่คือ bug ที่แก้ไปแล้ว — เดิมไม่เช็คเลยทำ msg เป็น nil แล้ว panic)
-- ถ้าได้ message → จด state, unmarshal, ส่งเข้า channel
+- `select` + `time.After(5s)` — กัน consumer ค้างถ้า handler ช้า/channel เต็ม (แต่ message นั้นจะถูก skip → ดู known issue)
 
-### 7.4 appendMsgState / MarkAsComplete — จัดการ state (มี lock)
+### 9.5 appendMsgState / UpdateState
 
 ```go
 func (c *KafkaConsumer) appendMsgState(tp *kafka.TopicPartition) {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    c.msgsStateMap[tp.Offset] = false           // เพิ่งอ่าน ยังไม่ process
-    if c.maxReceived.Offset < tp.Offset {
-        c.maxReceived = &kafka.TopicPartition{Topic: tp.Topic, Partition: tp.Partition, Offset: tp.Offset}
-    }
-}
-```
-- `c.mu.Lock()` / `defer c.mu.Unlock()` — ล็อกก่อนแตะ map, ปลดตอนจบ
-- จด offset ใหม่ = `false` (ยังไม่เสร็จ) + อัปเดต offset สูงสุดถ้ามากกว่าเดิม
-
-```go
-func (c *KafkaConsumer) MarkAsComplete(tp *kafka.TopicPartition) {
-    logrus.WithField("OFFSET", tp.Offset).Info("MarkAsComplete")
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    c.msgsStateMap[tp.Offset] = true            // process เสร็จแล้ว
-}
-```
-- เปลี่ยน state ของ offset เป็น `true` — เรียกจาก handler ตอน process เสร็จ (ผ่าน `defer` ใน saveToDB)
-
-### 7.5 commitOffsetLoop — หัวใจ sequential commit
-
-```go
-ticker := time.NewTicker(c.commitDur)        // เต้นทุก 15 วิ
-for {
-    select {
-    case <-ticker.C:                          // ถึงรอบ commit
-        c.mu.Lock()
-        ...
-        for offset := c.lastCommited; offset < c.maxReceived.Offset; offset++ {
-            completed, exists := c.msgsStateMap[offset]
-            if !exists { continue }
-            if completed {
-                delete(c.msgsStateMap, offset)    // เสร็จแล้ว เก็บกวาด
-                continue
-            }
-            latestToCommit.Offset = offset        // เจอตัวยังไม่เสร็จ → หยุด
-            break
-        }
-        c.mu.Unlock()
-        ...
-        c.Consumer.CommitOffsets([]kafka.TopicPartition{latestToCommit})
-    case <-c.exitCH:
-        return                                 // ได้สัญญาณหยุด → ออก
-    }
-}
-```
-- `select { case <-ticker.C: … case <-c.exitCH: … }` — รอสัญญาณจาก 2 channel: ครบ 15 วิ หรือ สั่งหยุด
-- loop ไล่จาก `lastCommited` ขึ้นไปหา offset แรกที่ยัง `false` → commit ได้แค่ถึงก่อนหน้านั้น (sequential — ข้ามรูไม่ได้)
-- `delete(c.msgsStateMap, offset)` — ตัวที่เสร็จและจะ commit แล้วก็ลบทิ้งจาก map (ไม่ให้ map โตไม่หยุด)
-- `CommitOffsets(...)` — commit จริงเข้า Kafka
-
-> ⚠️ จุดนี้มี known issue: บาง path `continue`/`break` ขณะถือ lock ทำให้เสี่ยง deadlock (ดู ARCHITECTURE.md §7)
-
-### 7.6 ready check
-
-```go
-func (c *KafkaConsumer) checkReadyToAccept() error {
-    defer func() { c.isReady = true }()
-    for {
-        select {
-        case <-c.readyCH:
-            return nil
-        default:
-            time.Sleep(1 * time.Second)
-            isReady, err := c.readyCheck()
-            ...
-            if isReady { return nil }
-        }
+    c.mu.RLock(); prtnState := c.msgsStateMap[tp.Partition]; c.mu.RUnlock()
+    prtnState.mu.Lock(); defer prtnState.mu.Unlock()
+    prtnState.state[tp.Offset] = MsgState_Pending                   // จด Pending ใน partition นั้น
+    if prtnState.maxReceived.Load() < int32(tp.Offset) {
+        prtnState.maxReceived.Store(int32(tp.Offset))
     }
 }
 
-func (c *KafkaConsumer) readyCheck() (bool, error) {
-    assignment, err := c.Consumer.Assignment()   // partition ที่ถูก assign
-    return len(assignment) > 0, nil               // มี partition = พร้อม
+func (c *KafkaConsumer) UpdateState(tp *kafka.TopicPartition, newState MsgState) {
+    c.mu.Lock(); prtnState, ok := c.msgsStateMap[tp.Partition]; c.mu.Unlock()
+    if !ok { return }
+    prtnState.mu.Lock(); prtnState.state[tp.Offset] = newState; prtnState.mu.Unlock()
 }
 ```
-- วนเช็คทุก 1 วิ ว่า consumer ได้รับ partition มาดูแลแล้วหรือยัง (`Assignment()` คืน list partition ที่ถือ)
-- ได้ partition (len > 0) = พร้อมรับงาน
+- 2 ชั้นของ lock: `c.mu` กัน `msgsStateMap` (หา partition), `prtnState.mu` กัน `state` ของ partition นั้น
+- `UpdateState` — handler เรียกหลัง process เสร็จ ตั้ง Success/Error
 
-### 7.7 initializeKafkaTopic / waitForTopicReady
+### 9.6 rebalance callbacks (สรุป — เต็มใน REBALANCE.md)
 
-- `initializeKafkaTopic` — ใช้ `AdminClient` สร้าง topic (`NumPartitions: 1`) ถ้ายังไม่มี (ถ้ามีแล้วก็ข้าม), แล้วรอจน topic พร้อม
-- `waitForTopicReady` — วนถาม metadata จน leader ของทุก partition พร้อม (`partition.Leader != -1`) ก่อนปล่อยให้อ่าน
+```go
+func (c *KafkaConsumer) rebalanceCB(_ *kafka.Consumer, event kafka.Event) error {
+    switch ev := event.(type) {
+    case kafka.AssignedPartitions: return c.assignPrntCB(&ev)   // ได้ partition → สร้าง state + เปิด commit loop
+    case kafka.RevokedPartitions:  return c.revokePrtnCB(&ev)   // เสีย partition → commit ค้าง + หยุด loop + ปล่อย
+    }
+    return nil
+}
+```
+- `assignPrntCB` — ถาม committed offset → `NewPartitionState` ต่อ partition → `go commitOffsetLoop` → `IncrementalAssign`
+- `revokePrtnCB` — `cancel()` loop → `findLatestToCommit` → **`CommitOffsets` ก่อนปล่อย** → `IncrementalUnassign`
 
 ---
 
-## Step 8 — `cmd/main.go`
-
-ประกอบทุกอย่างเข้าด้วยกัน + รัน loop หลัก
+## Step 10 — `cmd/main.go`
 
 ```go
 type Server struct {
@@ -600,129 +451,76 @@ type Server struct {
     msgCH     chan *shared.Message
     eventRepo *repo.EventRepo
 }
-```
-- `Server` รวมทุก component ไว้ในที่เดียว (producer, consumer, channel, repo)
 
-```go
 func NewServer(eventRepo *repo.EventRepo) *Server {
-    msgCH := make(chan *shared.Message, 64)
-    c, err := consumer.NewKafkaConsumer(msgCH)
-    if err != nil {
-        panic(err)
-    }
+    msgCH := make(chan *shared.Message, 64)        // buffered channel
+    c := consumer.NewKafkaConsumer(msgCH)          // คืนค่าเดียว
     return &Server{
-        producer:  producer.NewKafkaProducer(""),
-        consumer:  c,
-        msgCH:     msgCH,
-        eventRepo: eventRepo,
+        producer:  producer.NewKafkaProducer(),    // ไม่รับ arg
+        consumer:  c, msgCH: msgCH, eventRepo: eventRepo,
     }
 }
-```
-- `make(chan *shared.Message, 64)` — สร้าง **buffered channel** ขนาด 64 (อุ้ม message ได้ 64 ตัวก่อนบล็อก — เผื่อ handler ช้ากว่า consumer)
-- สร้าง consumer (ส่ง msgCH เข้าไปให้มันยิงเข้า) + producer (`""` = ใช้ topic default)
-- consumer สร้างไม่สำเร็จก็ panic
 
-```go
 func (s *Server) produceMsg() {
     ticket := time.NewTicker(time.Second)
-    defer ticket.Stop()
     for range ticket.C {
         event := repo.NewEvent()
-        payload, err := json.Marshal(event)
-        if err != nil {
-            fmt.Printf("error marshalling event = %v\n", err)
-            continue
-        }
-        s.producer.Producer(string(payload))
+        payload, _ := json.Marshal(event)
+        s.producer.Produce(payload)                 // ส่ง []byte ตรงๆ
     }
 }
-```
-- `time.NewTicker(time.Second)` — ticker เต้นทุก 1 วิ, `defer ticket.Stop()` — หยุด ticker ตอนจบ
-- `for range ticket.C` — วนทุกครั้งที่ ticker เต้น (ไม่สนค่าเวลา)
-- สร้าง Event → `json.Marshal` เป็น JSON → ยิงผ่าน producer (ส่ง JSON ตรงกับที่ consumer จะ unmarshal)
 
-```go
-func (s *Server) handleMsg(msg *shared.Message) {
-    ctx := context.Background()
-    s.saveToDB(ctx, msg)
-}
-```
-- handler ของแต่ละ message — สร้าง context เปล่าแล้วส่งต่อไป saveToDB
-
-```go
-func (s *Server) saveToDB(ctx context.Context, msg *shared.Message) {
-    repo.TxClosure(ctx, s.eventRepo, func(ctx context.Context, tx *sqlx.Tx) (string, error) {
-        defer s.consumer.MarkAsComplete(msg.Metadata)   // จบเมื่อไหร่ก็ mark เสร็จ
-
-        event := s.eventRepo.Get(ctx, tx, msg.Event.EventId)
-        if event != nil {                                 // เคยมีแล้ว → ข้าม
-            eMsg := fmt.Sprintf("offset = %d, eventID %s already existing -> skipping\n", msg.Metadata.Offset, msg.Event.EventId)
-            return "", errors.New(eMsg)
+func (s *Server) saveToDB(ctx, msg *shared.Message) {
+    _, err := repo.TxClosure(ctx, s.eventRepo, func(ctx, tx) (string, error) {
+        if s.eventRepo.Get(ctx, tx, msg.Event.EventId) != nil {
+            return "", nil                          // เคยมี = idempotent skip (ถือว่าสำเร็จ)
         }
-        id, err := s.eventRepo.Insert(ctx, tx, msg.Event) // ยังไม่มี → insert
-        if err != nil {
-            return "", err
-        }
-        return id, nil
+        return s.eventRepo.Insert(ctx, tx, msg.Event)
     })
-}
-```
-- เรียก `TxClosure` แล้วส่ง **closure** (logic ที่จะทำใน transaction) เข้าไป
-- `defer s.consumer.MarkAsComplete(msg.Metadata)` — ไม่ว่าผลเป็นไง (insert สำเร็จ หรือ skip เพราะซ้ำ) ก็ mark offset นี้ว่า "เสร็จ" → commit loop จะ commit ผ่านได้
-- `Get` ก่อน → ถ้าเจอ (`!= nil`) คืน error "skipping" (idempotent — กันทำซ้ำ)
-- ถ้าไม่เจอ → `Insert`
-- ค่า return ของ closure ตัดสินว่า TxClosure จะ commit (nil error) หรือ rollback (มี error)
-
-```go
-func main() {
-    db, err := repo.NewDBConn()
     if err != nil {
-        panic(err)
+        s.consumer.UpdateState(msg.Metadata, consumer.MsgState_Error)   // พลาด → Error
+        return
     }
-    er := repo.NewEventRepo(db)
-    s := NewServer(er)
+    s.consumer.UpdateState(msg.Metadata, consumer.MsgState_Success)     // สำเร็จ → Success
+}
 
-    go s.produceMsg()                  // เริ่มยิง event (goroutine)
-    for msg := range s.msgCH {         // main: รับ message จาก channel ไม่หยุด
-        go s.handleMsg(msg)            // แตก goroutine process แต่ละตัว (async)
+func main() {
+    db, _ := repo.NewDBConn()
+    s := NewServer(repo.NewEventRepo(db))
+
+    go s.consumer.RunConsumer()        // ★ เริ่ม consumer (เดิม constructor ทำ)
+    go s.produceMsg()
+    for msg := range s.msgCH {
+        go s.handleMsg(msg)            // fan-out: process ขนาน
     }
 }
 ```
-- ต่อ DB → สร้าง repo → สร้าง Server (ซึ่งสร้าง consumer + producer ข้างใน)
-- `go s.produceMsg()` — ยิง event แยก goroutine
-- `for msg := range s.msgCH` — **main goroutine** วนรับ message จาก channel (บล็อกรอจนกว่ามี message) — channel ไม่ปิด เลยรันตลอด
-- `go s.handleMsg(msg)` — แต่ละ message แตก goroutine ใหม่ → process **ขนานกัน** (นี่คือที่มาของการเสร็จไม่เรียงลำดับ → ต้องมี sequential commit)
+- `RunConsumer()` ต้องเรียกเอง (ย้ายมาจาก constructor)
+- `saveToDB` ส่งผลจริงเข้า `UpdateState` (Success/Error) แทนการ mark complete เฉยๆ → enum Error ทำงานตามออกแบบ
+- `Produce(payload)` ส่ง `[]byte` ตรง (ไม่ต้อง `string()`)
 
 ---
 
-## สรุปภาพรวมการประกอบ
+## สรุปการประกอบ + goroutine ที่วิ่งพร้อมกัน
 
 ```
 main()
- ├─ NewDBConn()                    Step 3
- ├─ NewEventRepo(db)               Step 4
- └─ NewServer(er)
-      ├─ make(msgCH, 64)
-      ├─ NewKafkaConsumer(msgCH)   Step 7  → เปิด 3 goroutine (read/commit/ready)
-      └─ NewKafkaProducer("")      Step 6  → เปิด 1 goroutine (delivery report)
+ ├─ NewDBConn → NewEventRepo → NewServer
+ │                              ├─ NewKafkaConsumer (subscribe + rebalanceCB)
+ │                              └─ NewKafkaProducer (delivery report goroutine)
+ ├─ go RunConsumer()  → checkReadyToAccept + consumeLoop
+ ├─ go produceMsg()   → ยิง event ทุกวิ
+ └─ for range msgCH   → go handleMsg → saveToDB → UpdateState
 
- ├─ go produceMsg()   → ทุก 1 วิ: NewEvent → Marshal → Produce
- └─ for range msgCH   → go handleMsg → saveToDB (TxClosure: Get→Insert→MarkAsComplete)
+goroutine ตอนรัน:
+1. produceMsg                       5. checkReadyToAccept
+2. producer delivery-report         6. main loop + handleMsg แต่ละตัว
+3. consumeLoop (อ่าน)               7. commitOffsetLoop — 1 ตัว/partition (เพิ่ม/ลดตาม rebalance)
+4. rebalanceCB (ตอน assign/revoke)
 ```
 
-goroutine ที่วิ่งพร้อมกันตอนรัน:
-1. `produceMsg` — ยิง event
-2. producer delivery-report listener
-3. consumer `readMsgLoop` — อ่าน
-4. consumer `commitOffsetLoop` — commit ทุก 15 วิ
-5. consumer `checkReadyToAccept` — เช็คพร้อม
-6. main loop + `handleMsg` แต่ละตัว — process
+เชื่อมกันด้วย `MsgCH` (channel) + `msgsStateMap` (per-partition state + mutex/atomic)
 
-ทั้งหมดเชื่อมกันด้วย `msgCH` (channel) และ `msgsStateMap` (shared state + mutex) — นี่คือหัวใจที่ทำให้ทุกเส้นทำงานขนานกันได้โดยไม่ชนกัน
-
----
-
-> อ่านคู่กับ `ARCHITECTURE.md` (ภาพรวม + กลไกเชิงลึก + rebuild guide + known issues) จะเห็นภาพครบทั้งระดับบรรทัดและระดับระบบ
-
+> อ่านคู่: `ARCHITECTURE.md` (ภาพรวม+scaling), `MESSAGE_LIFECYCLE.md` (flow), `REBALANCE.md` (rebalance เชิงลึก)
 
 
