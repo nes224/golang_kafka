@@ -537,6 +537,8 @@ type Consumer interface {
 
 → สลับ transport = แก้แค่ implementation ของ interface นี้ (1-2 ไฟล์) · ที่เหลือไม่กระทบ
 
+> ✅ **โปรเจกต์นี้ทำแล้ว (2026-06-13):** `bus.Publisher`/`bus.Consumer` เป็น interface · concrete = `KafkaPublisher`/`KafkaConsumer` + `PubSubPublisher`/`PubSubConsumer` · เลือกด้วย `EVENT_TRANSPORT=kafka|pubsub` (`bus.Configure`) · **prod เคาะ = Pub/Sub** (ดู `PUBSUB_SETUP.md`) · relay/outbox/inbox/consumer logic ไม่ต้องแตะตอนสลับ — พิสูจน์แล้วว่า abstraction คุ้ม
+
 ### เทียบ transport
 | | Kafka | Pub/Sub (GCP) | Redpanda | RabbitMQ |
 |---|---|---|---|---|
@@ -687,7 +689,7 @@ users table  ──user.updated──►    hr_users table (cache)
 | consumer ไม่ idempotent | at-least-once → ซ้ำ → data พัง | UPSERT / เช็ค id |
 | ack ก่อน process | crash → message หาย | ack หลัง process สำเร็จ |
 | event เป็น command (`do.X`) | coupling · producer สั่ง consumer | event = fact (`X.happened`) |
-| business code import Kafka ตรงๆ | lock-in · สลับ transport ยาก | abstract ด้วย interface |
+| business code import Kafka ตรงๆ | lock-in · สลับ transport ยาก | abstract ด้วย interface (โปรเจกต์นี้แก้แล้ว 2026-06-13 → `bus.Publisher`/`Consumer` + Pub/Sub impl) |
 | projection เขียนจาก business code | ขัดกับ source of truth | เขียนจาก consumer เท่านั้น |
 | ไม่มี dead-letter | poison message block ทั้งคิว | DLQ หลัง N attempts |
 | ไม่มี version ใน envelope | schema เปลี่ยน → consumer พัง | version + backward-compat |
@@ -701,11 +703,16 @@ users table  ──user.updated──►    hr_users table (cache)
 | outbox table | `db/sqlc/schema.sql` → `event_outbox` |
 | enqueueEvent | `internal/adapter/postgres/outbox.go` |
 | atomic business+outbox | `internal/adapter/postgres/stock_repo.go` → `CreateReceipt` |
-| relay | `internal/adapter/relay/relay.go` |
+| relay (+ dead-letter + janitor) | `internal/adapter/relay/relay.go` |
 | envelope + topics + payloads | `erp_kafka_module/{envelope,topics,payloads}.go` |
-| bus abstraction | `erp_kafka_module/bus/{publisher,consumer}.go` |
-| consumer (projection) | `internal/adapter/consumer/hr_sync_consumer.go` |
+| **bus interface + Kafka impl** | `erp_kafka_module/bus/{publisher,consumer}.go` |
+| **bus Pub/Sub impl (+ DLQ · auto-provision)** | `erp_kafka_module/bus/pubsub.go` + `pubsub_emulator_test.go` |
+| **transport selector** | `EVENT_TRANSPORT` → `bus.Configure` ใน `cmd/api/main.go` · setup = `PUBSUB_SETUP.md` |
+| consumer (projection · idempotent UPSERT) | `internal/adapter/consumer/hr_sync_consumer.go` |
+| consumer (side-effect · inbox dedup) | `internal/adapter/consumer/procurement_consumer.go` + `postgres/procurement_repo.go` |
+| inbox table | `db/sqlc/schema.sql` → `processed_events` |
+| consumer restart loop (R4) | `internal/adapter/consumer/runner.go` |
 | projection repo | `internal/adapter/postgres/hr_projection_repo.go` |
 | sync HTTP (auth · ตรงข้าม async) | `internal/adapter/sessioncheck/validator.go` |
 
-> เคสจริงเต็มๆ: `HR_WAREHOUSE_COMMUNICATION.md`
+> เคสจริงเต็มๆ: `HR_WAREHOUSE_COMMUNICATION.md` · prod transport: `PUBSUB_SETUP.md`
