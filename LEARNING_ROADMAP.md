@@ -34,20 +34,21 @@
 
 เรียงตาม dependency — ทำต่อยอดจากของที่มีได้เลย
 
-### 1.1 Inbox Pattern / Idempotent Consumer
+### 1.1 Inbox Pattern / Idempotent Consumer  ✅ มีบทเรียนแล้ว → `INBOX_PATTERN.md`
 - **คืออะไร**: เก็บ event id ที่เคย process ลงตาราง `inbox` (หรือ unique constraint) เช็คก่อนทำ → กัน process ซ้ำตอน message ถูกส่งซ้ำ
-- **ตอนนี้มีแล้วแบบย่อ**: `Get` ก่อน `Insert` + `IsDuplicateKeyErr` — บทเรียนจะทำให้เป็นทางการ (แยกตาราง inbox, จัดการ race)
+- **ตอนนี้มีแล้วแบบย่อ**: `Get` ก่อน `Insert` + `IsDuplicateKeyErr` — บทเรียน `INBOX_PATTERN.md` ทำให้เป็นทางการ (แยกตาราง inbox, `ON CONFLICT` atomic, จัดการ race, map ไป ERP จริง)
 - **ทำไมสำคัญ**: at-least-once การันตีแค่ "ไม่หาย" แต่ "อาจซ้ำ" → inbox คือเกราะกันซ้ำฝั่งรับ
 
-### 1.2 Transactional Outbox Pattern
+### 1.2 Transactional Outbox Pattern  ✅ มีบทเรียนแล้ว → `OUTBOX_PATTERN.md`
 - **คืออะไร**: เขียน event ลงตาราง `outbox` **ใน transaction เดียวกับ business data** → worker แยกอ่าน outbox ยิงเข้า Kafka
 - **แก้ปัญหา**: dual-write — เขียน DB + ยิง Kafka ให้ atomic ไม่ได้ตรงๆ (ที่เคยถามเรื่อง rollback) outbox ทำให้ "ได้ทั้งคู่ หรือไม่ได้ทั้งคู่"
 - **คู่กับ inbox**: outbox (กัน event หายฝั่งส่ง) + inbox (กันซ้ำฝั่งรับ) = exactly-once แบบ practical ทั้ง pipeline
+- **บทเรียน `OUTBOX_PATTERN.md` เป็น blueprint พร้อม implement**: schema production-ready, โค้ด Go 3 ก้อน (enqueue/relay/publisher), 5 ปัญหาที่ต้องแก้, cleanup/monitoring, checklist 10 ขั้น, map ไป ERP จริง (eventpub/relay)
 
-### 1.3 CDC / Debezium
+### 1.3 CDC / Debezium  ✅ มีบทเรียนแล้ว → `CDC_DEBEZIUM.md`
 - **คืออะไร**: Debezium อ่าน transaction log (WAL) ของ Postgres → ยิงการเปลี่ยนแปลงเข้า Kafka อัตโนมัติ โดยแอปไม่ต้องเขียนโค้ดยิงเอง
 - **ทางเลือกแทน outbox**: เหมาะเวลาอยาก sync ข้อมูลข้ามระบบโดยไม่แตะ service เดิม
-- **เรียนทีหลังสุด**: เป็น infra/architecture ใหญ่ ต้องเข้าใจ outbox ก่อนถึงเทียบข้อดีข้อเสียได้
+- **บทเรียน `CDC_DEBEZIUM.md` ครอบคลุม**: WAL/logical replication, Debezium architecture + config Postgres จริง, Outbox vs CDC decision tree, Outbox+CDC hybrid (EventRouter), และ upgrade path จาก relay ของ ERP เมฆ
 
 ---
 

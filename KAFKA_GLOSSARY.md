@@ -79,6 +79,14 @@
 | **State Map** | โครงสร้างจำว่า offset ไหน process เสร็จแล้วบ้าง (ใช้กับ async + sequential commit) |
 | **Dual write problem** | ปัญหาเขียน 2 ระบบ (DB + Kafka) ให้ atomic พร้อมกันไม่ได้ตรงๆ |
 | **Transactional Outbox** | เขียน event ลงตาราง `outbox` ใน tx เดียวกับ business data → process แยกยิงเข้า Kafka ทีหลัง (แก้ dual write) |
+| **Inbox Pattern** | เก็บ event_id ที่เคย process ลงตาราง `inbox` → เช็คก่อนทำ กัน process ซ้ำฝั่งรับ (คู่กับ outbox) — ดู `INBOX_PATTERN.md` |
+| **CDC** (Change Data Capture) | จับทุกการเปลี่ยนแปลง (INSERT/UPDATE/DELETE) ในตาราง DB แล้ว stream เข้า Kafka อัตโนมัติ โดยแอปไม่ต้องยิงเอง — ดู `CDC_DEBEZIUM.md` |
+| **WAL** (Write-Ahead Log) | log ลำดับทุกการเปลี่ยนแปลงที่ Postgres เขียนก่อน commit เสมอ — CDC แอบอ่าน WAL ตัวนี้เพื่อจับ change |
+| **Logical replication** | ฟีเจอร์ Postgres แปลง WAL (binary) เป็น row-level change stream ผ่าน plugin `pgoutput` — ฐานของ CDC |
+| **Replication slot** | "บุ๊กมาร์ก" ว่า CDC อ่าน WAL ถึงไหนแล้ว (กัน PG ลบ WAL ที่ยังไม่อ่าน — ถ้าค้างนานๆ disk เต็มได้) |
+| **Debezium** | tool ทำ CDC ยอดนิยม รันเป็น connector บน Kafka Connect อ่าน WAL → ยิง change event เข้า Kafka |
+| **Kafka Connect** | framework รัน connector (source/sink) จัดการ fault-tolerance/offset/scaling ให้ — Debezium รันบนนี้ |
+| **Outbox Event Router** | pattern ลูกผสม: Debezium อ่านตาราง outbox แทน relay ที่เขียนเอง → ได้ business event + ไม่ต้อง maintain relay |
 | **Saga** | จัดการ transaction ข้ามหลาย service ด้วยลำดับ event + compensating action |
 | **Kafka Transactions / EOS** | transaction ภายใน Kafka (consume→process→produce + commit แบบ atomic) — ไม่ครอบ external DB |
 | **Event-driven** | สถาปัตยกรรมที่ producer ยิง event → หลาย service react แยกกัน |
