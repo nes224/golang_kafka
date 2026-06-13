@@ -4,7 +4,7 @@
 
 > สรุป 1 บรรทัด: เลิกยิง Kafka ตรงๆ จาก business logic (dual-write พังได้) — เขียน event ลงตาราง `outbox` ใน tx เดียวกับ business → process แยก (relay) อ่าน outbox ยิงเข้า Kafka แล้ว mark sent → ได้ทั้งคู่หรือไม่ได้ทั้งคู่ (atomic)
 
-> อ่านคู่: `INBOX_PATTERN.md` (กันซ้ำขาเข้า — คู่กับ outbox), `CDC_DEBEZIUM.md` (ทางเลือก/upgrade), `HR_KAFKA_WIRING.md` (outbox จริงใน ERP เมฆ)
+> อ่านคู่: `INBOX_PATTERN.md` (กันซ้ำขาเข้า — คู่กับ outbox), `CDC_DEBEZIUM.md` (ทางเลือก/upgrade), `HR_KAFKA_WIRING.md` (outbox จริงใน ERP)
 
 ---
 
@@ -120,7 +120,7 @@ CREATE INDEX IF NOT EXISTS idx_outbox_unpublished
 
 ## 4. โค้ด 1 — Event envelope + enqueue (ฝั่ง business)
 
-แยกเป็น package `eventpub` (ตรงกับที่ ERP เมฆใช้) ให้ business เรียกง่ายๆ
+แยกเป็น package `eventpub` (ตรงกับที่ ERP ใช้) ให้ business เรียกง่ายๆ
 
 ```go
 package eventpub
@@ -433,7 +433,7 @@ SELECT now() - min(created_at) FROM outbox WHERE published_at IS NULL;
 
 ## 11. Map ไป ERP จริง + ทั้ง 3 บทประกอบกันยังไง
 
-### 11.1 ERP เมฆใช้อยู่แล้ว (`HR_KAFKA_WIRING.md`)
+### 11.1 ERP ใช้อยู่แล้ว (`HR_KAFKA_WIRING.md`)
 
 โครงตรงกับบทนี้เป๊ะ — ต่างแค่ stack:
 
@@ -479,7 +479,7 @@ SELECT now() - min(created_at) FROM outbox WHERE published_at IS NULL;
 - **5 ปัญหาต้องแก้:** ordering, duplicate, relay ชนกัน, lost-on-crash, ตารางโต
 - **at-least-once** → ต้องคู่กับ **inbox** ถึงได้ effectively-once (ขั้น 8 ในchecklist — คนลืมบ่อย)
 - **implement project ใหม่:** ทำตาม checklist 10 ขั้น §10
-- **ERP เมฆ:** โครงมีแล้ว เติม graceful shutdown + inbox + cleanup + monitoring ให้ครบ
+- **ERP:** โครงมีแล้ว เติม graceful shutdown + inbox + cleanup + monitoring ให้ครบ
 - **upgrade path:** relay เริ่มเป็นภาระ → เปลี่ยนเป็น Debezium EventRouter อ่านตาราง outbox (CDC_DEBEZIUM.md §7)
 
 > Phase 1 (Inbox + Outbox + CDC) ครบแล้ว — ถัดไป Phase 2 production hardening (security/shutdown/RF/error) ใน `LEARNING_ROADMAP.md`

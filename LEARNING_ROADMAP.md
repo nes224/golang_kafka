@@ -48,7 +48,7 @@
 ### 1.3 CDC / Debezium  ✅ มีบทเรียนแล้ว → `CDC_DEBEZIUM.md`
 - **คืออะไร**: Debezium อ่าน transaction log (WAL) ของ Postgres → ยิงการเปลี่ยนแปลงเข้า Kafka อัตโนมัติ โดยแอปไม่ต้องเขียนโค้ดยิงเอง
 - **ทางเลือกแทน outbox**: เหมาะเวลาอยาก sync ข้อมูลข้ามระบบโดยไม่แตะ service เดิม
-- **บทเรียน `CDC_DEBEZIUM.md` ครอบคลุม**: WAL/logical replication, Debezium architecture + config Postgres จริง, Outbox vs CDC decision tree, Outbox+CDC hybrid (EventRouter), และ upgrade path จาก relay ของ ERP เมฆ
+- **บทเรียน `CDC_DEBEZIUM.md` ครอบคลุม**: WAL/logical replication, Debezium architecture + config Postgres จริง, Outbox vs CDC decision tree, Outbox+CDC hybrid (EventRouter), และ upgrade path จาก relay ของ ERP
 
 ---
 

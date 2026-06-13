@@ -1,0 +1,22 @@
+services:
+  # GCP Pub/Sub emulator — แทน Kafka broker · ไม่ต้องมี cloud จริง
+  pubsub-emulator:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    command: >
+      gcloud beta emulators pubsub start
+      --host-port=0.0.0.0:8085
+      --project=local-project
+    ports:
+      - "8085:8085"
+
+  # PostgreSQL — เก็บ events + inbox · migration รันอัตโนมัติตอน init
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: alphamech
+      POSTGRES_PASSWORD: alphamech1234@
+      POSTGRES_DB: kafka_yt
+    ports:
+      - "5433:5432"   # map 5433 บน host ให้ตรงกับ DB_PORT default
+    volumes:
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro

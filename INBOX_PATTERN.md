@@ -314,7 +314,7 @@ DB จัดการ atomicity ให้ในคำสั่งเดียว
 | **แก้ปัญหา** | process **ซ้ำ** (dedup ขาเข้า) | event **หาย** ตอนเขียน DB+Kafka (dual-write ขาออก) |
 | **กลไก** | จำ event_id ที่เคยเห็น → ชน = ข้าม | เขียน event ลงตาราง outbox ใน tx เดียวกับ business → relay ยิงเข้า Kafka |
 | **การันตี** | at-least-once → effectively-once ขาเข้า | ไม่หายขาออก (atomic กับ business) |
-| **ในงานเมฆ** | บทนี้ (ยังไม่ลงโค้ดใน golang_kafka) | ลงแล้วใน ERP (`HR_KAFKA_WIRING.md`) |
+| **ในงานนี้** | บทนี้ (ยังไม่ลงโค้ดใน golang_kafka) | ลงแล้วใน ERP (`HR_KAFKA_WIRING.md`) |
 
 ```
    Service A (HR)                    Kafka                Service B (inventory)
@@ -323,7 +323,7 @@ DB จัดการ atomicity ให้ในคำสั่งเดียว
  └──────────────────── exactly-once แบบ practical ทั้ง pipeline ───────────────┘
 ```
 
-**ลำดับเรียนที่แนะนำ:** บทนี้ (Inbox) → `OUTBOX_PATTERN.md` (Outbox) → `CDC_DEBEZIUM.md` (CDC/Debezium) ของเมฆพิเศษตรงที่ Outbox ลงมือจริงใน ERP ไปก่อนแล้ว — เรียน Inbox จบเอาไปเติมฝั่ง consumer ของ inventory ได้เลย
+**ลำดับเรียนที่แนะนำ:** บทนี้ (Inbox) → `OUTBOX_PATTERN.md` (Outbox) → `CDC_DEBEZIUM.md` (CDC/Debezium) จุดพิเศษคือ Outbox ลงมือจริงใน ERP ไปก่อนแล้ว — เรียน Inbox จบเอาไปเติมฝั่ง consumer ของ inventory ได้เลย
 
 ---
 

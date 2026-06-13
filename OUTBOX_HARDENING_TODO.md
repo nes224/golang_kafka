@@ -3,6 +3,8 @@
 > status: **core outbox ทำเสร็จแล้ว · เหลือ hardening 3 อัน (production-grade)**
 > context: `EVENT_DRIVEN_PLAYBOOK.md` §11–12 · reference impl: `relay.go` + `outbox.go`
 > ความสำคัญ: ไม่กระทบ correctness ของ pattern (gan dual-write + Kafka ล่ม ทำได้แล้ว) · แต่จำเป็นก่อน scale/production จริง
+>
+> 🔁 **Fleet note (2026-06-13):** dead-letter + janitor (TODO1+2) port ไป **HR relay** ด้วยแล้ว (`erp_hr_module_be/internal/adapter/eventpub/relay.go` + migration `0098_outbox_dead_letter.up.sql`) · HR relay ยัง **unwired** (latent · จะ active ตอน wire ตาม `HR_KAFKA_WIRING.md`) แต่เกิดมาพร้อม hardening แล้ว · build+vet ทั้ง 3 module ผ่าน
 
 ## สถานะปัจจุบัน (baseline)
 
@@ -13,10 +15,12 @@
 - `OutboxRepo` — `FetchUnpublished` / `MarkPublished` / `IncrAttempt`
 - bus abstraction (`bus/publisher.go`)
 
-❌ **ยังไม่ทำ (hardening · doc นี้):**
-1. 🔴 Dead-letter (poison message)
-2. 🟡 Outbox janitor (cleanup)
-3. 🟡 Multi-replica safety (double-publish)
+สถานะ hardening (อัปเดต 2026-06-13):
+1. ✅ **Dead-letter (poison message)** — code-complete (build+vet ผ่าน · รอ verify runtime ด้วย Kafka จริง)
+2. ✅ **Outbox janitor (cleanup)** — code-complete (ทางเลือก A · goroutine ใน relay)
+3. ❌ 🟡 **Multi-replica safety (double-publish)** — ยังไม่ทำ (เลื่อน · ตอนนี้ deploy single instance)
+
+> ✅ TODO 1+2 ทำใน `0006_outbox_dead_letter.sql` + `outbox.go` + `relay.go` (มี dead-letter + janitor ticker) · ดูล่าง
 
 ---
 
@@ -70,11 +74,12 @@ if err := r.publisher.PublishRaw(...); err != nil {
    ```
 
 ### Acceptance
-- [ ] migration + schema.sql sync
-- [ ] poison message (จงใจส่ง topic ผิด/payload พัง) → ถูก mark `failed_at` หลัง 10 attempts
-- [ ] event ที่อยู่หลัง poison ยัง publish ได้ปกติ (ไม่ block)
-- [ ] มี log/alert ตอน dead-letter
-- [ ] `go build && go vet` ผ่าน
+- [x] migration (`0006_outbox_dead_letter.sql`) + schema.sql sync (เพิ่ม `failed_at`/`last_error` + partial index exclude dead-letter)
+- [x] poison message → mark `failed_at` หลัง `maxAttempts=10` (relay `drain` · `MarkDeadLetter`) — *รอ verify runtime*
+- [x] event ที่อยู่หลัง poison ยัง publish ได้ (drain ใช้ `continue` แทน `return` หลัง dead-letter)
+- [x] log ตอน dead-letter (`log.Printf("outbox relay: DEAD-LETTER ...")`)
+- [x] `go build && go vet` ผ่าน
+- [ ] ⏳ verify runtime: ยิง poison จริงด้วย Kafka broker → เห็น `failed_at` set + คิวไม่ block
 
 > ⚠️ trade-off: `continue` ข้าม poison = **เสีย order** เฉพาะ key ของ poison นั้น · ยอมรับได้ (ดีกว่า block ทั้งคิว) · event key อื่นไม่กระทบ
 
@@ -111,9 +116,9 @@ DELETE FROM event_outbox WHERE published_at < now() - interval '7 days';
 ```
 
 ### Acceptance
-- [ ] row ที่ `published_at` เกิน 7 วัน ถูกลบ
-- [ ] **ไม่ลบ** row ที่ `failed_at` (dead-letter เก็บไว้ debug) · **ไม่ลบ** row ที่ยัง unpublished
-- [ ] ลบเป็น batch ไม่ lock table นาน (ถ้า volume สูง — `LIMIT` + loop)
+- [x] row ที่ `published_at` เกิน 7 วัน ถูกลบ (`DeletePublishedBefore` · janitor ticker 24h ใน `relay.Run`)
+- [x] **ไม่ลบ** row ที่ `failed_at` (query กรอง `published_at IS NOT NULL` เท่านั้น) · **ไม่ลบ** unpublished
+- [ ] ⏳ ลบเป็น batch (`LIMIT` + loop) — ยังไม่ทำ · ทำเมื่อ volume สูงพอจะ lock นาน (ตอนนี้ single DELETE พอ)
 
 > เก็บ 7 วันเป็น default (debug/audit) · ปรับได้ตามต้องการ
 
@@ -181,9 +186,10 @@ cmd/api/main.go                             ← (ถ้าทำ leader election
 
 ---
 
-## ฝั่ง Consumer — VERIFIED ✅ (แยก track · ไม่มี gap)
+## ฝั่ง Consumer — 2 gap เจอ+ปิดแล้ว 2026-06-13 (เดิม doc เคยเคลมว่า "ไม่มี gap")
 
-> verify จากโค้ดจริง 2026-06-12 · ดูทฤษฎี playbook §7
+> verify รอบ 2 จากโค้ดจริง 2026-06-13 · ดูทฤษฎี playbook §7
+> ⚠️ verify รอบแรก (2026-06-12) เคลม "ไม่มี gap" — **ผิด** · เจอ 2 gap จริง (R3/R4 ล่าง) แก้แล้ว
 > ⚠️ **"ไม่มี inbox table" ไม่ใช่ gap** — เป็น design choice ที่ถูกต้องสำหรับ projection (อธิบายล่าง)
 
 ### Scorecard
@@ -191,10 +197,20 @@ cmd/api/main.go                             ← (ถ้าทำ leader election
 | concept | สถานะ | หลักฐาน |
 |---|---|---|
 | **Idempotent Consumer** | ✅ ทำแล้ว | `hr_projection_repo.go` → `UpsertUser`/`UpsertProject` ใช้ `ON CONFLICT (pk) DO UPDATE` |
-| **Manual Commit** | ✅ ทำแล้ว | `bus/consumer.go` `Run()` → `FetchMessage` → handler → `CommitMessages` (commit หลัง process) |
+| **Manual Commit + retry** | ✅ **แก้ R3 (2026-06-13)** | เดิม handler fail → `continue` = ข้ามตัวที่ fail (FetchMessage รอบหน้าได้ตัวถัดไป → commit เลย offset = หายถาวร) · แก้เป็น `process()` retry ตัวเดิม backoff จน success หรือครบ `handlerMaxRetries=8` → skip (กัน block) |
+| **Consumer restart** | ✅ **แก้ R4 (2026-06-13)** | เดิม `Run` คืน error → goroutine ตายถาวร (broker blip = consumer ตายจน restart app) · แก้ `runTopic` เป็น restart loop + `restartBackoff=3s` (ออกเฉพาะ ctx cancel) |
 | **Preventing Duplicate** | ✅ ทำแล้ว | ผ่าน UPSERT idempotency (duplicate = ทับค่าเดิม · ไม่เสียหาย) |
-| **Envelope poison handling** | ✅ ทำแล้ว | envelope unmarshal พัง → log + commit + skip (กันค้าง) |
+| **Envelope poison handling** | ✅ ทำแล้ว | envelope unmarshal พัง → log + commit + skip (poison · retry ไปก็พัง) |
 | **Inbox table** (processed_events) | ⏸️ ยังไม่ทำ | **ไม่จำเป็นสำหรับ projection** (ดูเหตุผล) |
+
+### 🔴 R3 · Manual commit เดิมทิ้ง message ตอน handler error (at-least-once พัง)
+`bus/consumer.go` เดิม: `if err := h(...); err != nil { continue }` — comment เขียนว่า "FetchMessage รอบหน้าได้ตัวเดิม" แต่ **ผิด** · kafka-go `FetchMessage` คืน message ตัวถัดไปเสมอ → ตัวที่ fail ถูกข้าม · พอ commit ตัวหลัง offset เลยตัวที่ fail → restart มาก็ไม่ได้ตัวนั้นอีก = **event หายถาวร**
+- **แก้:** เพิ่ม `process(ctx, env, h)` — retry ตัวเดิมด้วย exponential backoff (200ms→5s cap) จน success · block partition ชั่วคราว (รักษา order) · ครบ `handlerMaxRetries=8` (poison) → log loud + commit ข้าม · ctx cancel ระหว่าง retry → ออกโดยไม่ commit (redeliver รอบ restart)
+- ⚠️ shared module → กระทบ consumer ทั้ง fleet (HR ไม่ใช้ consumer · OT ถ้ามีจะ correct ขึ้น) · build HR/inventory/kafka ผ่านหมด
+
+### 🔴 R4 · Consumer ตายถาวรตอน FetchMessage error
+`hr_sync_consumer.go` เดิม: `runTopic` เรียก `c.Run` ครั้งเดียว · Run คืน error (broker error ที่ไม่ใช่ ctx cancel) → goroutine จบ → **consumer ตายจนกว่าจะ restart app** (Kafka สะดุดชั่วคราว = projection หยุด sync ถาวร)
+- **แก้:** `runTopic` เป็น restart loop · Run คืน error + ctx ยัง alive → start consumer ใหม่หลัง `restartBackoff=3s` · ออกเฉพาะตอน ctx ถูกยกเลิก (shutdown)
 
 ### หลักฐานโค้ด
 
@@ -238,8 +254,24 @@ ON CONFLICT (user_id) DO UPDATE SET name=EXCLUDED.name, ...  // ซ้ำ = ท�
 | ส่วน | สถานะ |
 |---|---|
 | **Producer · core outbox** | ✅ ครบ (atomic enqueue + relay + happy path + Kafka-down) |
-| **Producer · hardening** | ❌ 3 gap (dead-letter / janitor / multi-replica · doc นี้ TODO 1-3) |
-| **Consumer · idempotent + manual commit** | ✅ ครบ (UPSERT + FetchMessage→commit) |
+| **Producer · hardening** | ⚠️ เหลือ 1 gap — ✅ dead-letter (TODO1) · ✅ janitor (TODO2) · ❌ multi-replica (TODO3 · เลื่อน · ดูเหตุผล) |
+| **Consumer · idempotent** | ✅ ครบ (UPSERT by PK) |
+| **Consumer · at-least-once (retry)** | ✅ **แก้ R3 (2026-06-13)** — retry ตัวเดิมจน success/poison · เดิมทิ้ง message |
+| **Consumer · availability (restart)** | ✅ **แก้ R4 (2026-06-13)** — restart loop · เดิมตายถาวรตอน broker error |
 | **Consumer · inbox** | ⏸️ ยังไม่ต้องทำ (projection ใช้ UPSERT พอ · ทำเมื่อมี side-effect consumer) |
 
-→ **gap จริงที่ต้องปิด = ฝั่ง producer 3 อัน (TODO 1-3 ด้านบน)** · ฝั่ง consumer สมบูรณ์แล้ว
+→ TODO 1+2 (producer) + R3+R4 (consumer) ปิดแล้ว (2026-06-13) · **gap ที่เหลือ = TODO 3 multi-replica เท่านั้น**
+
+### TODO 3 (multi-replica) — double-publish เกิดจริง แต่ "ไม่เป็นปัญหา" (ไม่ใช่ correctness risk) · อัปเดต 2026-06-13
+> ⚠️ แก้ premise เดิมที่ผิด: deploy บน **Cloud Run autoscaling (min 1 · max 10–20) + instance-based billing (CPU always-on)** ทั้ง HR และ inventory → **ไม่ใช่ single instance** · relay รันทุก instance พร้อมกันตอน scale-out → double-publish **เกิดขึ้นจริง** (HR ก็มี relay = `internal/adapter/eventpub/relay.go`)
+
+**แต่ double-publish ไม่พัง correctness** — เพราะ 2 property ประกอบกัน:
+1. **consumer idempotent** (UPSERT by PK) → event ซ้ำ = เขียนทับค่าเดิม ไม่เสียหาย
+2. **relay ปัจจุบันไม่มี SKIP LOCKED** → ทุก relay ดึง row **ชุดเดียวกัน** (`WHERE published_at IS NULL ORDER BY created_at`) → publish event ตัวเดียวกันเรียงเหมือนกัน → ได้แค่ **duplicate ไม่ reorder** (event เก่ามาก่อนใหม่เสมอ ทุก relay) · `MarkPublished` race = last-write-wins ไม่เสียหาย
+
+→ ต้นทุนเดียวที่เหลือ = **Kafka write volume × N** ตอน scale-out (cost · ไม่ใช่ correctness)
+
+### 🔑 ห้าม "แก้" R6 ด้วย SKIP LOCKED (จะทำให้แตก)
+- `SELECT FOR UPDATE SKIP LOCKED` (doc เดิมเคยแนะนำ) → relay คนละ batch · **ทำลาย per-key order ข้าม replica** (replica B publish event ใหม่กว่า ก่อน replica A publish event เก่ากว่าของ key เดียวกัน) — โค้ด naive ปัจจุบัน **ปลอดภัยกว่า** fix นี้ภายใต้ multi-replica
+- ถ้าวันหนึ่งอยากตัด cost duplicate จริง → ใช้ **leader election (advisory lock)** เท่านั้น · relay เดียว active · รักษา order · **แต่** ต้องถือ dedicated conn + กัน pgxpool reap idle conn (lock หลุดเงียบ → double-publish กลับมา) — งานที่ต้องระวัง ไม่ใช่แค่ใส่ SQL
+- **สรุป: ปล่อยไว้แบบนี้ดีที่สุด** · double-publish ปัจจุบัน harmless · "fix" ผิดวิธีอันตรายกว่าไม่ fix

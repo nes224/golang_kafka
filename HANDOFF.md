@@ -28,7 +28,15 @@ Go application สาธิต Kafka pipeline ระดับ production — pro
 - ✅ **Rebalance** (cooperative-sticky + commit-before-revoke)
 - ✅ `main.go` sync กับ consumer ใหม่ (เพิ่ง sync — ดู ⚠️ ข้างล่าง)
 
-**ยังไม่ได้ทำ:** inbox/outbox/CDC, production hardening (ดู roadmap)
+**เอกสารบทเรียน Phase 1 — เขียนครบแล้ว ✅ (session 2026-06-13):**
+- ✅ `INBOX_PATTERN.md` — กันประมวลผลซ้ำ (idempotent consumer แบบเต็ม)
+- ✅ `OUTBOX_PATTERN.md` — blueprint พร้อม implement (schema+โค้ด+checklist 10 ขั้น)
+- ✅ `CDC_DEBEZIUM.md` — CDC/Debezium + Outbox vs CDC decision tree
+- ✅ `STUDY_GUIDE.md` — เส้นทางเรียน step-by-step ร้อยทุกไฟล์ (Stage 0-5)
+
+> ⚠️ ทั้งหมดเป็น **เอกสาร/บทเรียน** — ยังไม่ได้ลงโค้ด Phase 1 จริงใน repo นี้ (โค้ดยังเป็น idempotent แบบย่อ ไม่มีตาราง inbox/outbox) ของจริงที่ลงแล้วอยู่ใน ERP (`HR_KAFKA_WIRING.md`)
+
+**ยังไม่ได้ทำ (โค้ด):** ลงตาราง inbox/outbox จริงใน golang_kafka, production hardening (ดู roadmap)
 
 ---
 
@@ -83,12 +91,14 @@ config ทั้งหมดอยู่ใน `internal/shared/kafka-config.go`
 ## 📋 แผนถัดไป (สรุป — เต็มใน LEARNING_ROADMAP.md)
 
 ```
-Phase 0  ✅ sync main.go → ยืนยันรันได้ + ทดสอบ rebalance   ← อยู่ตรงนี้
-Phase 1  Inbox → Outbox → CDC          (correctness patterns — มีบทเรียน)
+Phase 0  ⏳ sync main.go → ยืนยันรันได้ + ทดสอบ rebalance   ← ค้างตรงนี้ (ยังไม่ confirm run)
+Phase 1  ✅ Inbox → Outbox → CDC          (บทเรียนครบ — ยังไม่ลงโค้ดใน repo นี้)
 Phase 2  security/shutdown/RF/error    (Tier 1 — ก่อน ship)
 Phase 3  DLQ/producer config/metrics   (Tier 2 — ก่อนรับ traffic)
 Phase 4  schema registry/TLS/test      (Tier 3 — ทนทานระยะยาว)
 ```
+
+**ทำต่อได้ 2 ทาง:** (ก) กลับมาปิด Phase 0 — confirm `go run ./cmd` + ทดสอบ rebalance · (ข) ลงโค้ด Phase 1 จริงใน repo นี้ตาม blueprint (`OUTBOX_PATTERN.md §10` checklist) หรือเอา pattern ไปเติม ERP (graceful shutdown relay + inbox inventory + cleanup + monitoring)
 
 ---
 
@@ -97,6 +107,7 @@ Phase 4  schema registry/TLS/test      (Tier 3 — ทนทานระยะ�
 | ไฟล์ | เนื้อหา |
 |---|---|
 | **HANDOFF.md** (นี่) | จุดเริ่ม — สถานะ + วิธีรัน + ทำต่อ |
+| `STUDY_GUIDE.md` | 🎓 เส้นทางเรียน step-by-step ร้อยทุกไฟล์ (เริ่มที่นี่ถ้าจะเรียน) |
 | `ARCHITECTURE.md` | ภาพรวม + mechanics + rebuild + known issues + scaling |
 | `CODE_WALKTHROUGH.md` | โค้ดทีละบรรทัด เรียงตามลำดับ build |
 | `MESSAGE_LIFECYCLE.md` | flow ชีวิต message (รับ→process→commit) |
@@ -107,7 +118,7 @@ Phase 4  schema registry/TLS/test      (Tier 3 — ทนทานระยะ�
 | `LEARNING_ROADMAP.md` | แผนเรียน/พัฒนาต่อ 5 phase |
 | `KAFKA_GLOSSARY.md` | คำศัพท์ทั้งหมด 9 หมวด |
 
-แนะนำลำดับอ่านสำหรับคนใหม่: HANDOFF → ARCHITECTURE → CODE_WALKTHROUGH → (REBALANCE / MESSAGE_LIFECYCLE ตามต้องการ)
+แนะนำลำดับอ่านสำหรับคนใหม่: **เปิด `STUDY_GUIDE.md`** — มันร้อยทุกไฟล์เป็นเส้นทางเรียน step-by-step (Stage 0-5) พร้อมคำถามเช็คตัวเองแต่ละขั้น ไม่ต้องเดาเองว่าอ่านอะไรก่อนหลัง
 
 ---
 

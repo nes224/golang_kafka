@@ -44,7 +44,7 @@ flow เต็ม — 3 จังหวะ
 ❌ ถ้าส่ง Kafka ตรงๆ (ไม่มี outbox)
 tx.Commit()              // business commit ✅
 kafka.Publish(event)     // ← Kafka ล่ม → event หายถาวร 💀
-ปัญหา: DB กับ Kafka เป็นคนละระบบ มัด transaction ร่วมกันไม่ได้ → ถ้าอันที่สองพัง = ข้อมูลไม่ตรง (dual-write problem ที่เมฆถามไปก่อนหน้า)
+ปัญหา: DB กับ Kafka เป็นคนละระบบ มัด transaction ร่วมกันไม่ได้ → ถ้าอันที่สองพัง = ข้อมูลไม่ตรง (dual-write problem)
 
 ✅ ถ้ามี outbox
 tx.Exec("INSERT business")

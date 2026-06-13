@@ -107,7 +107,7 @@ B ยังไม่ได้ +1000 ✗   ← เงิน 1000 หายไป�
   → ไม่มีเงินหาย
 กฎ: ทำสำเร็จทั้ง 2 → commit · ถ้าอันใดอันหนึ่ง fail → rollback ทั้งหมด กลับไปจุดเริ่ม
 
-ในโค้ดของเมฆเอง — CreateReceipt (รับเข้าสต็อก)
+ในโค้ดจริง — CreateReceipt (รับเข้าสต็อก)
 ตอนรับเข้า 1 ใบ มันมีหลายคำสั่งที่ต้อง atomic:
 
 tx, _ := pool.Begin(ctx)         // ── เริ่มก้อน atomic ──
@@ -151,4 +151,4 @@ D	Durability	commit แล้วไม่หาย แม้ไฟดับ
 สรุปสั้นสุด
 Atomic = มัดหลายคำสั่งเป็นก้อนเดียว · สำเร็จยกก้อน หรือล้มยกก้อน · ไม่มีสภาพครึ่งๆ
 
-ใน Postgres ทำได้ด้วย Begin → คำสั่งหลายอัน → Commit (สำเร็จ) / Rollback (ยกเลิก) — ที่เมฆเห็น tx, _ := pool.Begin(ctx) ทุกที่ใน stock/requisition repo นั่นแหละคือการสร้างก้อน atomic
+ใน Postgres ทำได้ด้วย Begin → คำสั่งหลายอัน → Commit (สำเร็จ) / Rollback (ยกเลิก) — ที่เห็น tx, _ := pool.Begin(ctx) ทุกที่ใน stock/requisition repo นั่นแหละคือการสร้างก้อน atomic
