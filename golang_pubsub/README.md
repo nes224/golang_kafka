@@ -9,14 +9,21 @@
 
 ## ภาพรวมสถาปัตยกรรม
 
+แยกเป็น **2 service คนละ binary** (จำลอง microservices จริง — เหมือน HR↔Warehouse ใน ERP):
+
 ```
-producer (ticker 1s) ──Publish──▶ Pub/Sub Topic ──▶ Subscription ──Receive──▶ handler
-                                  (emulator)                                    │
-                                                                                ▼
-                                                              TxClosure { inbox + events }
-                                                                                │
-                                                                  สำเร็จ → Ack · พลาด → Nack
+ Service A: cmd/producer            Pub/Sub (emulator)         Service B: cmd/consumer
+ ───────────────────────                                       ──────────────────────
+ producer (ticker 1s)  ──Publish──▶  Topic ──▶ Subscription  ──Receive──▶  handler
+ (ไม่ต่อ DB)                                                                  │
+                                                                             ▼
+                                                           TxClosure { inbox + events }
+                                                                             │
+                                                               สำเร็จ → Ack · พลาด → Nack
 ```
+
+> producer ยิง event อย่างเดียว (ไม่รู้จัก DB) · consumer รับไป process ลง Postgres
+> ทั้งคู่แชร์แค่ `internal/*` packages + event contract (Envelope) — คุยกันผ่าน Pub/Sub เท่านั้น
 
 ทุกอย่างคุยผ่าน interface กลาง `bus.Publisher` / `bus.Consumer` (playbook §10)
 → business/producer/handler **ไม่รู้จัก Pub/Sub ตรงๆ** สลับกลับไป Kafka แก้แค่ `internal/pubsub/*`
@@ -57,7 +64,8 @@ producer (ticker 1s) ──Publish──▶ Pub/Sub Topic ──▶ Subscription
 ## โครงสร้างโค้ด
 
 ```
-cmd/main.go                      ประกอบ + รัน + graceful shutdown (SIGINT/SIGTERM)
+cmd/producer/main.go             Service A — ยิง event อย่างเดียว (ไม่ต่อ DB)
+cmd/consumer/main.go             Service B — รับ event ไป process ลง DB (inbox + events)
 internal/shared/config.go        config ผ่าน env ทั้งหมด (ไม่ hardcode)
 internal/shared/types.go         Envelope (event contract) + encode/decode
 internal/bus/bus.go              ★ interface กลาง Publisher / Consumer (transport-agnostic)
@@ -86,11 +94,12 @@ make up
 # 2. เติม indirect deps ของ pubsub (จำเป็นรอบแรก)
 make tidy        # = go mod tidy
 
-# 3. รันแอป (ชี้ไป emulator ให้แล้วใน Makefile)
-make run
+# 3. รัน 2 service แยก terminal
+make run-consumer   # terminal 1 — Service B (รับไปลง DB)
+make run-producer   # terminal 2 — Service A (ยิง event)
 ```
 
-จะเห็น log `PUBLISHED ...` สลับกับ `INSERT ok ...` ทุกวินาที
+producer จะ log `PUBLISHED ...` ทุกวินาที · consumer จะ log `INSERT ok ...` ตามมา
 เปิดอีก terminal ดูข้อมูล:
 
 ```bash
@@ -101,9 +110,10 @@ SELECT count(*) FROM inbox;     -- ควรเท่ากับ events (1 even
 ```
 
 ### ทดสอบ idempotency / scale
-- รัน `make run` **2 process พร้อมกัน** → Pub/Sub แบ่ง message ให้แต่ละตัว (ไม่ซ้ำ) โดยไม่มีโค้ด rebalance
-- ลองกด Ctrl+C ตัวหนึ่ง → message ที่ค้างจะไป process ที่อีกตัวเอง (server redeliver)
+- รัน `make run-consumer` **2 ตัวพร้อมกัน** (คนละ terminal) → Pub/Sub แบ่ง message ให้แต่ละตัว (ไม่ซ้ำ) โดยไม่มีโค้ด rebalance
+- ลองกด Ctrl+C consumer ตัวหนึ่ง → message ที่ค้างจะไป process ที่อีกตัวเอง (server redeliver)
 - inbox กันไม่ให้ count ใน `events` เกินจำนวน event จริง แม้ Pub/Sub จะ redeliver
+- รัน `make run-producer` หลาย instance ได้เช่นกัน → ยิง event ถี่ขึ้น
 
 ### เปิด ordering (ทางเลือก)
 ตั้ง `PUBSUB_ORDERING=true` → ใช้ `OrderingKey` (= EventType) รักษาลำดับ event ชนิดเดียวกัน

@@ -14,11 +14,16 @@ logs:
 tidy:
 	go mod tidy
 
-# รันแอป (ชี้ client ไป emulator)
-run:
+# รันแยก service — เปิดคนละ terminal
+run-producer:
 	PUBSUB_EMULATOR_HOST=localhost:8085 \
 	PUBSUB_PROJECT_ID=local-project \
-	go run ./cmd
+	go run ./cmd/producer
+
+run-consumer:
+	PUBSUB_EMULATOR_HOST=localhost:8085 \
+	PUBSUB_PROJECT_ID=local-project \
+	go run ./cmd/consumer
 
 # เปิด psql ดูตาราง events / inbox
 psql:
