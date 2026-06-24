@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package hr.v1;
+
+// บอก protoc ว่า gen Go ลง package ไหน + import path อะไร
+option go_package = "github.com/golang_grpc/proto/hrpb;hrpb";
+
+// ============================================================
+// HRService — สัญญากลาง (contract) ที่ Engineer / Warehouse / Procurement
+// ใช้เรียกเข้ามาถาม HR · เขียนครั้งเดียว gen code ได้ทั้ง server + client
+// ============================================================
+service HRService {
+  // ตรวจว่า session ยัง active + ดึง roles/permissions สด
+  rpc ValidateSession(ValidateSessionRequest) returns (ValidateSessionResponse);
+
+  // ดึงข้อมูลพนักงาน
+  rpc GetEmployee(GetEmployeeRequest) returns (Employee);
+}
+
+// ---- ValidateSession ----
+message ValidateSessionRequest {
+  string session_id = 1;
+}
+
+message ValidateSessionResponse {
+  bool   active       = 1;   // session ยังใช้ได้ไหม
+  string employee_id  = 2;
+  repeated string roles       = 3;
+  repeated string permissions = 4;
+}
+
+// ---- GetEmployee ----
+message GetEmployeeRequest {
+  string employee_id = 1;
+}
+
+message Employee {
+  string id          = 1;
+  string first_name  = 2;
+  string last_name   = 3;
+  string department  = 4;
+  string job_title   = 5;
+  repeated string roles = 6;
+}
